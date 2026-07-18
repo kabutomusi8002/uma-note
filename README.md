@@ -150,12 +150,12 @@ UTF-8の行指向 `RACE/1` 形式です。複数レースを1ファイルへ連�
 ```text
 ---RACE---
 FORMAT_VERSION: 1
-ID: race-example
-DATA_SCOPE: test
-DATE: 2026-07-19
-COURSE: 函館
+ID: "race-example"
+DATA_SCOPE: "test"
+DATE: "2026-07-19"
+COURSE: "函館"
 RACE_NUMBER: 11
-START_TIME: 15:25
+START_TIME: "15:25"
 ...
 ---END RACE---
 ```

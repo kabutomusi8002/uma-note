@@ -61,3 +61,6 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# device-local race backups
+/backups/*.race.txt

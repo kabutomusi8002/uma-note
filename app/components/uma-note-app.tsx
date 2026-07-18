@@ -734,12 +734,13 @@ export function UmaNoteApp() {
   }
 
   function importRaces(imported: RaceRecord[]) {
-    for (const race of imported) markRaceDirty(race.id);
+    const normalized = normalizeKnownDemoRaceScopes(imported, DEMO_RACE_IDS);
+    for (const race of normalized) markRaceDirty(race.id);
     setRaces((current) => {
-      const ids = new Set(imported.map((race) => race.id));
-      return [...imported, ...current.filter((race) => !ids.has(race.id))];
+      const ids = new Set(normalized.map((race) => race.id));
+      return [...normalized, ...current.filter((race) => !ids.has(race.id))];
     });
-    for (const race of imported) queueRaceCloudSave(race);
+    for (const race of normalized) queueRaceCloudSave(race);
   }
 
   function activateRule(id: string) {
@@ -1964,6 +1965,8 @@ function SettingsView({
 }) {
   const [importText, setImportText] = useState("");
   const [importError, setImportError] = useState<string | null>(null);
+  const [exportPreview, setExportPreview] = useState("");
+  const [exportError, setExportError] = useState<string | null>(null);
   const [email, setEmail] = useState("");
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<"idle" | "working" | "error">("idle");
@@ -2039,14 +2042,60 @@ function SettingsView({
     }
   }
 
+  function prepareExport(): string | null {
+    try {
+      const text = exportRaces(races);
+      setExportError(null);
+      return text;
+    } catch (cause) {
+      setExportPreview("");
+      setExportError(cause instanceof Error ? cause.message : "レースデータを書き出せませんでした。");
+      return null;
+    }
+  }
+
+  function showExport() {
+    const text = prepareExport();
+    if (text) setExportPreview(text);
+  }
+
   async function copyExport() {
-    const text = exportRaces(races);
-    await navigator.clipboard.writeText(text);
-    onNotify("---RACE--- 形式をクリップボードへコピーしました");
+    const text = prepareExport();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      onNotify("---RACE--- 形式をクリップボードへコピーしました");
+    } catch {
+      const fallback = document.createElement("textarea");
+      fallback.value = text;
+      fallback.setAttribute("readonly", "");
+      fallback.style.position = "fixed";
+      fallback.style.opacity = "0";
+      let copied = false;
+      try {
+        document.body.appendChild(fallback);
+        fallback.focus();
+        fallback.select();
+        copied = document.execCommand("copy");
+      } catch {
+        copied = false;
+      } finally {
+        fallback.remove();
+      }
+      if (!copied) setExportPreview(text);
+      onNotify(
+        copied
+          ? "---RACE--- 形式をクリップボードへコピーしました"
+          : "クリップボードへコピーできなかったため、出力内容を画面に表示しました",
+      );
+    }
   }
 
   function downloadExport() {
-    const blob = new Blob([exportRaces(races)], { type: "text/plain;charset=utf-8" });
+    const text = prepareExport();
+    if (!text) return;
+    setExportPreview(text);
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -2111,7 +2160,9 @@ function SettingsView({
         <section className="settings-card import-export-card">
           <div className="panel-heading"><div><p className="eyebrow dark">PORTABLE FORMAT</p><h2>---RACE--- 入出力</h2></div><span className="subtle-note">UTF-8 · RACE/1</span></div>
           <p>バックアップや別環境への移行に使える、人が読めるテキスト形式です。</p>
-          <div className="export-actions"><button className="secondary-button" type="button" onClick={copyExport}>コピー</button><button className="primary-button" type="button" onClick={downloadExport}>ファイルへ書き出す</button></div>
+          <div className="export-actions"><button className="secondary-button" type="button" disabled={!races.length} onClick={copyExport}>コピー</button><button className="secondary-button" type="button" disabled={!races.length} onClick={showExport}>内容を表示</button><button className="primary-button" type="button" disabled={!races.length} onClick={downloadExport}>ファイルへ書き出す</button></div>
+          {exportError && <p className="form-error" role="alert">{exportError}</p>}
+          {exportPreview && <Field label="書き出し内容"><textarea readOnly rows={10} value={exportPreview} /></Field>}
           <Field label="取り込むテキスト"><textarea rows={8} value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={`---RACE---\nFORMAT_VERSION: 1\n...`} /></Field>
           {importError && <p className="form-error" role="alert">{importError}</p>}
           <button className="primary-button full" type="button" disabled={!importText.trim()} onClick={runImport}>内容を検証して取り込む</button>

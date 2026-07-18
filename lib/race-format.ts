@@ -38,7 +38,7 @@ export const RACE_BLOCK_END = "---END RACE---";
 export const RACE_FORMAT_SPECIFICATION = `RACE/1 (UTF-8)
 各レースは ${RACE_BLOCK_START} と ${RACE_BLOCK_END} で囲みます。
 各項目は KEY: JSON値 の1行形式です。空行と # から始まるコメントは無視されます。
-キーは大文字・固定で、STATUS と ENTRIES 以外は必須です。
+キーは大文字・固定で、DATA_SCOPE、STATUS、ENTRIES 以外は必須です。
 DATA_SCOPE、STATUS、ENTRIES、および LOCK 内の postTimeLockedAt は任意です。
 文字列はJSON文字列としてダブルクォートで囲みます。`;
 

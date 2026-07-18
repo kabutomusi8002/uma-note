@@ -11,10 +11,12 @@ import {
 } from "../lib/race-format";
 import {
   DEMO_RACE,
+  DEMO_RACE_IDS,
   DEMO_RACES,
   createDemoRace,
   createDemoRaces,
 } from "../lib/demo-data";
+import { normalizeKnownDemoRaceScopes } from "../lib/race-scope";
 
 describe("RACE/1 round trip", () => {
   it("全フィールドを失わず1レースを往復する", () => {
@@ -34,6 +36,26 @@ describe("RACE/1 round trip", () => {
     delete legacyRace.dataScope;
     const parsedLegacy = parseRace(exportRace(legacyRace));
     expect(parsedLegacy.dataScope).toBeUndefined();
+  });
+
+  it("区分のない既知デモの旧バックアップを取り込み時にdemoへ正規化する", () => {
+    const legacyDemo = createDemoRace();
+    delete legacyDemo.dataScope;
+
+    const imported = parseRaces(exportRace(legacyDemo));
+    expect(normalizeKnownDemoRaceScopes(imported, DEMO_RACE_IDS)[0].dataScope).toBe("demo");
+  });
+
+  it("live・demo・testが混在するバックアップを区分ごと往復する", () => {
+    const mixedScopes = (["live", "demo", "test"] as const).map(
+      (dataScope, index) => ({
+        ...createDemoRace(),
+        id: `race-scope-${index + 1}`,
+        dataScope,
+      }),
+    );
+
+    expect(parseRaces(exportRaces(mixedScopes))).toEqual(mixedScopes);
   });
 
   it("レース状態・出走馬一覧・発走時刻ロックを失わず往復する", () => {
@@ -108,6 +130,10 @@ describe("RACE/1 round trip", () => {
 });
 
 describe("RACE/1 invalid input", () => {
+  it("レースがない場合は空のバックアップを書き出さない", () => {
+    expect(() => exportRaces([])).toThrow(/エクスポートするレースがありません/);
+  });
+
   it("必須キー不足をキー名と行番号つきで報告する", () => {
     const invalid = exportRace(DEMO_RACE)
       .split("\n")
@@ -153,6 +179,15 @@ describe("RACE/1 invalid input", () => {
       "FORMAT_VERSION: 1\nUNKNOWN: true",
     );
     expect(() => parseRace(invalid)).toThrow(/未定義のキー.*UNKNOWN/);
+  });
+
+  it("未定義の収支区分を拒否する", () => {
+    const invalid = exportRace(DEMO_RACE).replace(
+      'DATA_SCOPE: "demo"',
+      'DATA_SCOPE: "invalid"',
+    );
+
+    expect(() => parseRace(invalid)).toThrow(/race\.dataScope/);
   });
 
   it("未対応バージョンを拒否する", () => {
