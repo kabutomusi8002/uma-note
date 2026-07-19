@@ -24,14 +24,14 @@
 |買い目|単勝、馬連、ワイド、3連複、3連単|
 |買い方|通常、BOX、フォーメーション。重複を除外して点数を展開|
 |金額|点数、1点金額、合計投資額を自動計算|
-|ロック|発走前の明示ロック、発走時刻後のDB強制ロック、変更履歴|
+|ロック|発走前の明示ロック、発走時刻後のDB強制ロック、変更履歴、予想・予想買い目・使用ルールの独立スナップショット|
 |券面分離|予想案 `proposal` と実購入 `actual` を別管理|
 |結果|着順、100円あたり払戻、暫定／公式確定、実投資、払戻、収支、回収率|
 |収支区分|`live`（実収支）、`demo`、`test`を分離。デモ／テストは累計・レース別収支・反省傾向から除外|
 |反省|展開、馬場、軸、相手、買い目、資金、判断、その他に分類|
 |交換|バージョン付き `---RACE---` 形式の複数レース入出力|
 |ルール|予想ルールの版管理、使用版のスナップショット|
-|保存・同期|端末へ自動保存。メールリンク認証中はレース／ルールをSupabaseへ自動保存し、手動同期も可能|
+|保存・同期|LOCALモード、永続Outbox、再接続同期、メールリンク認証、端末間競合の比較・明示解決|
 |PWA|ホーム画面追加、スタンドアロン表示、アプリシェルと静的資産のオフラインキャッシュ|
 
 ## 画面構成
@@ -73,7 +73,7 @@ Windows PowerShellの場合：
 Copy-Item .env.example .env.local
 ```
 
-Supabaseをまだ接続しない場合は `.env.local` なしでも起動できます。レースとルールはブラウザの端末領域へ自動保存されるため、再読み込み後も続けられます。Supabaseを設定してログインすると、編集したレースとルール版をクラウドへも自動保存します。未編集のサンプルデータは自動送信されません。初期サンプルは `demo`、動作確認用レースは画面から `test` に設定でき、どちらも実収支集計へ含まれません。
+`.env.example` の接続値は空なので、そのまま複製してもLOCALモードになります。`.env.local` 自体を作らなくても起動できます。レース、ルール、設定は端末へ保存され、再読み込みやオフライン起動後も続けられます。Supabaseを設定してログインした場合も、編集はまず端末へ確定し、永続Outboxからクラウドへ送信します。未編集のサンプルデータは自動送信されません。初期サンプルは `demo`、動作確認用レースは `test` に設定でき、どちらも実収支集計へ含まれません。
 
 ### 3. 開発サーバーを起動
 
@@ -91,13 +91,13 @@ Supabaseで新しいプロジェクトを作成し、Project SettingsのAPI欄�
 
 ```dotenv
 NEXT_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon-or-publishable-key>
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<sb_publishable_...>
 NEXT_PUBLIC_SITE_URL=https://<your-production-domain>
 ```
 
 `NEXT_PUBLIC_SITE_URL`は公開時のOG画像URL用です。ローカルだけなら省略できます。
 
-`SUPABASE_SERVICE_ROLE_KEY` はブラウザ用ではありません。必要な場合もサーバーまたは管理作業だけに使い、`NEXT_PUBLIC_*` を付けないでください。
+旧プロジェクトでは `NEXT_PUBLIC_SUPABASE_ANON_KEY` も使用できます。`service_role`、`sb_secret_*`、DBパスワード、接続文字列はブラウザ用ではなく、このアプリのクライアントコードから参照しません。管理作業はSupabase CLIまたはDashboardの保護された設定で行ってください。
 
 ### 2. PostgreSQLスキーマを適用
 
@@ -120,7 +120,10 @@ SQL Editorを使う場合は、次の順に実行します。
 
 1. `supabase/migrations/0001_initial_schema.sql`
 2. `supabase/migrations/0002_race_data_scope.sql`
-3. `supabase/seed.sql`
+3. `supabase/migrations/0003_cloud_tenancy.sql`
+4. `supabase/migrations/0004_cloud_sync_protocol.sql`
+5. `supabase/migrations/0005_locked_snapshot_and_local_migration.sql`
+6. `supabase/seed.sql`
 
 マイグレーションには、テーブル、制約、インデックス、変更履歴トリガー、発走時刻ロック、集計ビュー、JSON保存RPC、RLSポリシーが含まれます。
 
@@ -131,17 +134,27 @@ Supabase AuthenticationのURL Configurationで、以下を登録します。
 - Site URL：公開先URL。開発時だけなら表示されたLocal URL
 - Redirect URLs：Local URLと本番URLを両方追加
 
-アプリの「設定」→「クラウド同期」でメールアドレスを入力します。受信したリンクから戻ると、保存済みデータを自動読込し、その後の変更を約700msの間隔で自動保存します。「クラウドから読込」と「Supabaseへ同期」は、明示的に再読込／全件同期したい場合に使えます。
+アプリの「設定」→「クラウド同期」でメールアドレスを入力します。認証はPKCEのメールリンク方式です。リンクは認証を開始した同じ端末・ブラウザで開いてください。初回は端末データを即時送信せず、完全バックアップとクラウド差分のプレビュー後に移行対象を確定します。
+
+通常編集は端末へ即時保存され、認証済みかつオンラインのときだけOutboxが送信されます。オフライン、通信失敗、トークン更新中でも変更は残り、再接続・画面復帰・手動再試行で同期を再開します。同期中にログアウトまたは別ユーザーへ切り替わった場合は進行中の要求を中断し、元ユーザーのOutboxをそのユーザー領域へ残します。別端末の更新はRLS付き`sync_change_log`のRealtime通知をきっかけに再取得しますが、通知自体を正本にはせず、version付きRPCの結果だけを採用します。migrationは、Supabase管理publicationが存在する場合だけこのchange logを自動追加します。
+
+初回移行画面は、バックアップ時点のレース・ルール・設定をクラウド値と比較します。レースは`live/demo/test`を保ったまま個別選択し、同名同版で内容の異なる不変ルール、設定の差、ロック済みレースは明示的な選択が終わるまで送信しません。発走後に初めて同期される未ロック予想は編集用の`client_record`として保持し、不変の発走前証跡には昇格しません。オフラインで発走前に明示ロックし、発走後に初めて同期した場合は、クライアント時刻由来であることを示す別の不変証跡へ保存します。`v0.1.1-local-clean`時代のロック済みレースは、当時固定されていた予想・予想買い目・ルールから`legacy_local_upgrade`証跡をバックアップ内に再構成してから、プレビュー付き専用移行を使用します。
 
 ### セキュリティ
 
-- アプリデータは `auth.uid()` 単位のRLSで分離
-- 統合RPCは `security invoker` でRLSを迂回しない
+- 共有マスター以外の全ユーザーデータ行に `user_id` を保持
+- 全テーブルでRLSを有効化し、`user_id = (select auth.uid())` の本人だけを許可
+- 集約配下の直接書き込みを禁止し、競合検査・冪等receipt付きRPCだけを許可
+- 公開RPCは認証を必須とし、内部helperの実行権限は`public`/`authenticated`から剥奪
+- 全集計ビューは `security_invoker = true`
 - 予想変更履歴は利用者が更新・削除できない
-- ロック後または発走時刻後の予想変更はDBでも拒否
+- ロック証跡は別テーブルの不変スナップショットとして更新・削除を拒否。ロック後の通常予想は別の現在値として同期され、証跡を変更しない
+- オフライン明示ロックと旧版再構成ロックは、サーバー時刻の証明と混同しないsource付き別テーブルへ保存
 - 予想案と実購入は `bet_slips.kind` で分離
 - 暫定結果は公式結果へ自動昇格せず、「結果を確定」した場合だけ累計収支へ反映
 - `races.data_scope = 'live'` のレースだけを収支ビューへ含め、デモ／テストの払戻を実績から除外
+- `sync_version`不一致は書き込まず、端末版とクラウド版を比較画面へ送る
+- mutation IDと安定client keyで再送・二重クリック・途中再開による重複を防止
 
 ## `---RACE---` 形式
 
@@ -162,6 +175,8 @@ START_TIME: "15:25"
 
 自由記述や入れ子データは、改行・区切り文字で壊れないようJSON値として表現します。未知の版、必須項目欠落、不正な券種や金額は保存前に拒否します。完全な仕様は `lib/race-format.ts` の `RACE_FORMAT_SPECIFICATION` にあります。
 
+クラウド移行前の完全バックアップには `UMA_NOTE_BACKUP/1` を使用します。内部にRACE/1本文を保持し、レースに未適用のルール、使用中ルール、ユーザー設定も一緒に保存します。所有者ID、クラウドUUID、認証トークン、Outbox内部情報は書き出しません。
+
 ## 品質確認
 
 ```bash
@@ -181,6 +196,13 @@ npm run build
 - `---RACE---` の往復変換、複数ブロック、壊れた入力
 - UIモデルとSupabase RPC JSON間の変換
 - DBロック回避、馬名保持、暫定結果、ルール版IDの回帰テスト
+- LOCALモード、旧localStorage移行、IndexedDBとOutboxの原子的保存
+- オフライン再送、mutation冪等性、二端末version競合、3-way比較
+- 全ユーザーテーブルのuser_id/RLS、別ユーザー拒否、秘密情報の非公開
+- バックアップ、移行プレビュー、自然キー重複、再開receipt
+- DB正規形のロックスナップショットをクライアント形式へ戻す往復変換
+- `v0.1.1-local-clean`の旧ロックをsource付き完全snapshotへ昇格する互換テスト
+- ルール／設定だけの移行確認、Realtime再取得、競合解決と再送予約の原子的保存
 
 ## 本番ビルドと公開
 
@@ -197,15 +219,15 @@ Cloudflare Workersへ公開する場合は、初回だけ `npx wrangler login` �
 npx vinext deploy
 ```
 
-`vinext deploy` は本番ビルドとWorkersへのデプロイをまとめて実行します。Supabaseを使う公開版では、実行前に `NEXT_PUBLIC_SUPABASE_URL`、`NEXT_PUBLIC_SUPABASE_ANON_KEY`、`NEXT_PUBLIC_SITE_URL` をビルド環境へ設定してください。
+`vinext deploy` は本番ビルドとWorkersへのデプロイをまとめて実行します。Supabaseを使う公開版では、実行前に `NEXT_PUBLIC_SUPABASE_URL`、`NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`、`NEXT_PUBLIC_SITE_URL` をビルド環境へ設定してください。
 
-PWAのService Workerは本番ビルドでだけ登録します。初回オンライン表示後はアプリシェルとビルド済み資産をキャッシュし、端末に自動保存した入力をオフラインでも開けます。通信断中の変更は端末に残るため、再接続後に手動同期するか、対象を再編集してクラウド保存を再試行してください。Service Worker変更時はキャッシュ版を更新します。
+PWAのService Workerは本番ビルドでだけ登録します。初回オンライン表示後はアプリシェルとビルド済み資産をキャッシュし、端末に保存した入力をオフラインでも開けます。通信断中の変更はOutboxに残り、再接続後のアプリ表示中に自動同期します。認証トークンをService Workerへ渡すバックグラウンド同期は行いません。
 
 ## ディレクトリ
 
 ```text
 app/                       画面、PWA manifest、Service Worker登録
-lib/                       型、計算、RACE形式、Supabaseアダプタ
+lib/                       型、計算、RACE形式、端末DB、同期エンジン、Supabaseアダプタ
 public/                    PWAアイコン、Service Worker
 supabase/migrations/       PostgreSQLマイグレーション
 supabase/seed.sql          競馬場・反省カテゴリの共有マスター

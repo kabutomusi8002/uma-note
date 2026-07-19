@@ -64,3 +64,4 @@ next-env.d.ts
 
 # device-local race backups
 /backups/*.race.txt
+/backups/*.uma-note.json

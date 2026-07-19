@@ -403,6 +403,106 @@ export function validateRaceRecord(value: unknown): RaceRecord {
     ? undefined
     : timestampAt(lock.postTimeLockedAt, "race.lock.postTimeLockedAt");
 
+  let lockedSnapshot: RaceRecord["lock"]["lockedSnapshot"];
+  if (lock.lockedSnapshot !== undefined) {
+    if (!isLocked || lockedAt === null) {
+      throw new RaceFormatError(
+        "race.lock.lockedSnapshot は明示ロック済みレースだけに保存できます",
+      );
+    }
+    const snapshot = objectAt(
+      lock.lockedSnapshot,
+      "race.lock.lockedSnapshot",
+    );
+    const snapshotRace = objectAt(
+      snapshot.race,
+      "race.lock.lockedSnapshot.race",
+    );
+    const snapshotLockedAt = timestampAt(
+      snapshot.lockedAt,
+      "race.lock.lockedSnapshot.lockedAt",
+    );
+    if (snapshotLockedAt !== lockedAt) {
+      throw new RaceFormatError(
+        "race.lock.lockedSnapshot.lockedAt は lock.lockedAt と一致する必要があります",
+      );
+    }
+    const snapshotBets = arrayAt(
+      snapshot.proposedBets,
+      "race.lock.lockedSnapshot.proposedBets",
+    ).map((plan, index) =>
+      validateBetPlan(
+        plan,
+        `race.lock.lockedSnapshot.proposedBets[${index}]`,
+      ),
+    );
+    lockedSnapshot = {
+      schemaVersion: integerAt(
+        snapshot.schemaVersion,
+        "race.lock.lockedSnapshot.schemaVersion",
+        1,
+        1,
+      ) as 1,
+      ...(snapshot.provenance === undefined
+        ? {}
+        : {
+            provenance: enumAt(
+              snapshot.provenance,
+              ["explicit_lock", "legacy_local_upgrade"] as const,
+              "race.lock.lockedSnapshot.provenance",
+            ),
+          }),
+      race: {
+        id: stringAt(snapshotRace.id, "race.lock.lockedSnapshot.race.id"),
+        ...(snapshotRace.dataScope === undefined
+          ? {}
+          : {
+              dataScope: enumAt(
+                snapshotRace.dataScope,
+                RACE_DATA_SCOPES,
+                "race.lock.lockedSnapshot.race.dataScope",
+              ),
+            }),
+        date: isoDateAt(
+          snapshotRace.date,
+          "race.lock.lockedSnapshot.race.date",
+        ),
+        course: stringAt(
+          snapshotRace.course,
+          "race.lock.lockedSnapshot.race.course",
+        ),
+        raceNumber: integerAt(
+          snapshotRace.raceNumber,
+          "race.lock.lockedSnapshot.race.raceNumber",
+          1,
+          12,
+        ),
+        startTime: startTimeAt(
+          snapshotRace.startTime,
+          "race.lock.lockedSnapshot.race.startTime",
+        ),
+        name: stringAt(
+          snapshotRace.name,
+          "race.lock.lockedSnapshot.race.name",
+          true,
+        ),
+      },
+      prediction: validatePrediction(
+        snapshot.prediction,
+        "race.lock.lockedSnapshot.prediction",
+      ),
+      proposedBets: snapshotBets,
+      ruleVersion:
+        snapshot.ruleVersion === null
+          ? null
+          : validateRuleVersion(
+              snapshot.ruleVersion,
+              "race.lock.lockedSnapshot.ruleVersion",
+            ),
+      lockedAt: snapshotLockedAt,
+    };
+  }
+
   const revisions = arrayAt(lock.revisions, "race.lock.revisions").map(
     (item, index) => {
       const revisionPath = `race.lock.revisions[${index}]`;
@@ -570,6 +670,7 @@ export function validateRaceRecord(value: unknown): RaceRecord {
       isLocked,
       lockedAt,
       ...(postTimeLockedAt === undefined ? {} : { postTimeLockedAt }),
+      ...(lockedSnapshot === undefined ? {} : { lockedSnapshot }),
       revisions,
     },
     result,

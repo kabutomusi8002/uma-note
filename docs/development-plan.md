@@ -127,9 +127,21 @@ Service Workerを変更したらpublic/sw.jsのCACHE_VERSIONを更新し、古�
 
 ## 6. オフラインデータの扱い
 
-PWAのCache Storageは公開アプリシェルと静的資産だけを保持し、API応答やSupabaseのユーザーデータを保存しない。レース、実購入、結果、変更履歴、ルールの作業コピーはlocalStorageへ自動保存する。Supabase接続時はPostgreSQLを端末間共有の正本とし、ログイン後の編集をデバウンスして自動送信する。
+PWAのCache Storageは公開アプリシェルと静的資産だけを保持し、API応答やSupabaseのユーザーデータを保存しない。レース、実購入、結果、変更履歴、ルール、設定の作業コピーはユーザー別IndexedDBへ自動保存し、旧localStorageは匿名LOCAL領域の互換コピーとしてだけ維持する。Supabase接続時はPostgreSQLを端末間共有の正本とし、ログイン後の編集をデバウンスして自動送信する。
 
-通信断中の変更は端末へ残るが、Service Workerによるバックグラウンド同期や自動競合解決は行わない。再接続後は設定画面の全件同期、または対象データの再編集でクラウド保存を再試行する。予想ロックはUIの現在時刻判定に加え、Supabase保存時にもDBトリガーで強制する。
+通信断中の変更は、端末snapshotとOutboxを同じIndexedDB transactionで保存する。再接続、認証更新、画面復帰、手動再試行を契機に、アプリ表示中の同期coordinatorが送信する。認証トークンをService Workerへ渡すバックグラウンド同期は行わない。
+
+送信前にクラウド差分を取得し、`expected_version`不一致は競合として停止する。同一項目のローカル版とクラウド版を無言で上書きせず、比較画面で利用者が採用版を決める。競合の解決済み記録、古いOutboxの削除、端末版を選んだ場合の再送予約は同じ端末DB transactionで確定する。ロックsnapshot、実購入、結果、払戻、`dataScope`の競合は自動統合しない。
+
+## 6.1 クラウド同期実装フェーズ
+
+1. 旧localStorageを残したままIndexedDBへコピーし、LOCALモード回帰テストを通す。
+2. user_id、RLS、複合FK、直接DML制限をmigrationへ追加する。
+3. mutation receipt、change log、expected version付きRPCを追加する。
+4. レース、ルール、設定をOutboxへ載せ、再接続flushを有効化する。
+5. 二端末競合の比較画面と明示解決を追加する。
+6. 完全バックアップ、移行preview、確認、再開journalを追加する。
+7. 外部Supabaseへ適用する前に、migrationとRLSテスト結果を別途レビューする。
 
 ## 7. 明示的な非対応
 

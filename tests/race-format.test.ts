@@ -13,9 +13,11 @@ import {
   DEMO_RACE,
   DEMO_RACE_IDS,
   DEMO_RACES,
+  DEMO_UPCOMING_RACE,
   createDemoRace,
   createDemoRaces,
 } from "../lib/demo-data";
+import { lockRacePrediction } from "../lib/prediction-lock";
 import { normalizeKnownDemoRaceScopes } from "../lib/race-scope";
 
 describe("RACE/1 round trip", () => {
@@ -77,6 +79,22 @@ describe("RACE/1 round trip", () => {
       '"postTimeLockedAt":"2026-07-12T06:45:00.000Z"',
     );
     expect(parseRace(exported)).toEqual(race);
+  });
+
+  it("独立した発走前ロックスナップショットを往復する", () => {
+    const locked = lockRacePrediction(structuredClone(DEMO_UPCOMING_RACE), {
+      revisionId: "backup-lock-revision",
+      changedAt: "2026-07-19T06:20:00.000Z",
+      lockedAt: "2026-07-19T06:20:01.000Z",
+    });
+
+    const restored = parseRace(exportRace(locked));
+    expect(restored.lock.lockedSnapshot).toEqual(
+      locked.lock.lockedSnapshot,
+    );
+    expect(restored.lock.lockedSnapshot?.proposedBets).toEqual(
+      locked.proposedBets,
+    );
   });
 
   it("任意拡張のない従来RACE/1文書も同じ既定値で読み込む", () => {
