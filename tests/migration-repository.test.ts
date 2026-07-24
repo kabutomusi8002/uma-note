@@ -29,6 +29,7 @@ function migrationInput() {
       rule: structuredClone(DEMO_RULE_VERSION),
       clientKey: "local-rule-1",
       expectedVersion: 2,
+      expectedRuleSetVersion: 4,
     }],
   };
 }
@@ -146,11 +147,50 @@ describe("trusted local migration repository", () => {
         rules: [{
           client_key: "local-rule-1",
           expected_version: 2,
-          payload: { client_key: "local-rule-1" },
+          payload: {
+            client_key: "local-rule-1",
+            expected_rule_set_version: 4,
+          },
         }],
       },
     });
     expect(JSON.stringify(stageParameters)).not.toMatch(/user_id|service_role|secret/i);
+  });
+
+  it("omits an unknown parent rule-set version from a legacy migration item", async () => {
+    const input = migrationInput();
+    const sourceRule = input.rules[0];
+    const legacyRule = {
+      rule: sourceRule.rule,
+      clientKey: sourceRule.clientKey,
+      expectedVersion: sourceRule.expectedVersion,
+    };
+    const mocked = mockMigrationClient([], async (name) => {
+      if (name === "stage_local_migration") {
+        return {
+          data: { status: "applied", document_id: DOCUMENT_ID, item_count: 0 },
+          error: null,
+        };
+      }
+      if (name === "complete_local_migration") {
+        return { data: { status: "applied" }, error: null };
+      }
+      throw new Error(`Unexpected RPC: ${name}`);
+    });
+
+    await applyTrustedLocalMigration(mocked.client, {
+      ...input,
+      rules: [legacyRule],
+    });
+
+    const stageParameters = mocked.rpc.mock.calls[0]?.[1] as {
+      p_document: {
+        rules: Array<{ payload: Record<string, unknown> }>;
+      };
+    };
+    expect(stageParameters.p_document.rules[0]?.payload).not.toHaveProperty(
+      "expected_rule_set_version",
+    );
   });
 
   it("returns item conflicts and never completes the document", async () => {

@@ -15,6 +15,10 @@ const connectionSource = readFileSync(
   `${root}/lib/sync/connection-presentation.ts`,
   "utf8",
 );
+const conflictDialogSource = readFileSync(
+  `${root}/app/components/sync-conflict-dialog.tsx`,
+  "utf8",
+);
 
 describe("cloud UI safety wiring", () => {
   it("previews races, immutable rules and settings before migration", () => {
@@ -41,6 +45,12 @@ describe("cloud UI safety wiring", () => {
     expect(handler).toContain('markConflictResolved(conflict, "local", successor)');
     expect(appSource).toContain("await resolveConflict(database");
     expect(appSource).toContain("cloudRuleAliasesRef.current.entries()");
+  });
+
+  it("shows both parent rule-set versions for a parent CAS conflict", () => {
+    expect(conflictDialogSource).toContain("親ルールセット版");
+    expect(conflictDialogSource).toContain("conflict.expectedParentVersion");
+    expect(conflictDialogSource).toContain("conflict.remoteParentVersion");
   });
 
   it("does not label internet reachability as an active Supabase connection", () => {

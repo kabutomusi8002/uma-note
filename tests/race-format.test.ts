@@ -97,6 +97,20 @@ describe("RACE/1 round trip", () => {
     );
   });
 
+  it("keeps the lock-time scope when the current race scope changes", () => {
+    const locked = lockRacePrediction(structuredClone(DEMO_UPCOMING_RACE), {
+      revisionId: "scope-lock-revision",
+      changedAt: "2026-07-19T06:20:00.000Z",
+      lockedAt: "2026-07-19T06:20:01.000Z",
+    });
+    const lockTimeScope = locked.lock.lockedSnapshot?.race.dataScope;
+    const current = { ...locked, dataScope: "test" as const };
+
+    const restored = parseRace(exportRace(current));
+    expect(restored.dataScope).toBe("test");
+    expect(restored.lock.lockedSnapshot?.race.dataScope).toBe(lockTimeScope);
+  });
+
   it("任意拡張のない従来RACE/1文書も同じ既定値で読み込む", () => {
     const legacyRace = createDemoRace();
     delete legacyRace.status;

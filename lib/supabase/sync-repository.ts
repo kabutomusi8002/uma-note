@@ -26,6 +26,18 @@ function numberValue(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function optionalNumberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function relatedRuleSet(row: JsonObject): JsonObject {
+  if (row.rule_set) return object(row.rule_set);
+  if (Array.isArray(row.prediction_rule_sets)) {
+    return object(row.prediction_rule_sets[0]);
+  }
+  return object(row.prediction_rule_sets);
+}
+
 export interface CloudChange {
   sequence: number;
   entityType: "race" | "rule" | "settings";
@@ -40,6 +52,8 @@ export interface CloudVersionedRecord<T> {
   clientKey: string;
   cloudId: string;
   version: number;
+  parentCloudId?: string;
+  parentVersion?: number;
 }
 
 export interface SyncBootstrap {
@@ -70,11 +84,16 @@ export async function loadSyncBootstrap(
   const rules = (Array.isArray(response.rules) ? response.rules : []).map((item) => {
     const row = object(item);
     const value = databaseRecordToRule(row);
+    const ruleSet = relatedRuleSet(row);
+    const parentCloudId = text(ruleSet.id);
+    const parentVersion = optionalNumberValue(ruleSet.sync_version);
     return {
       value,
       clientKey: text(row.client_key, value.id),
       cloudId: text(row.id),
       version: numberValue(row.sync_version),
+      ...(parentCloudId ? { parentCloudId } : {}),
+      ...(parentVersion === undefined ? {} : { parentVersion }),
     };
   });
   const rawSettings = response.settings ? object(response.settings) : null;

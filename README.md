@@ -123,7 +123,8 @@ SQL Editorを使う場合は、次の順に実行します。
 3. `supabase/migrations/0003_cloud_tenancy.sql`
 4. `supabase/migrations/0004_cloud_sync_protocol.sql`
 5. `supabase/migrations/0005_locked_snapshot_and_local_migration.sql`
-6. `supabase/seed.sql`
+6. `supabase/migrations/0006_pre_remote_hardening.sql`
+7. `supabase/seed.sql`
 
 マイグレーションには、テーブル、制約、インデックス、変更履歴トリガー、発走時刻ロック、集計ビュー、JSON保存RPC、RLSポリシーが含まれます。
 
@@ -149,11 +150,13 @@ Supabase AuthenticationのURL Configurationで、以下を登録します。
 - 全集計ビューは `security_invoker = true`
 - 予想変更履歴は利用者が更新・削除できない
 - ロック証跡は別テーブルの不変スナップショットとして更新・削除を拒否。ロック後の通常予想は別の現在値として同期され、証跡を変更しない
-- オフライン明示ロックと旧版再構成ロックは、サーバー時刻の証明と混同しないsource付き別テーブルへ保存
+- canonicalロック証跡にはロック時点の`data_scope`を固定し、scopeを含むJSON全体をSHA-256で検証。後からレース区分を変更しても証跡側は変えない
+- オフライン明示ロックは発走前に再接続した場合も、旧版再構成ロックと同様にサーバー時刻の証明と混同しないsource付き別テーブルへ保存
 - 予想案と実購入は `bet_slips.kind` で分離
 - 暫定結果は公式結果へ自動昇格せず、「結果を確定」した場合だけ累計収支へ反映
 - `races.data_scope = 'live'` のレースだけを収支ビューへ含め、デモ／テストの払戻を実績から除外
-- `sync_version`不一致は書き込まず、端末版とクラウド版を比較画面へ送る
+- ルール版と親ルールセットの`sync_version`を別々に比較し、どちらかの不一致も書き込まず端末版とクラウド版を比較画面へ送る
+- 成功・競合のどちらもmutation receiptへ保存し、同じmutation IDの再送で二重反映や結果のすり替わりを防止
 - mutation IDと安定client keyで再送・二重クリック・途中再開による重複を防止
 
 ## `---RACE---` 形式

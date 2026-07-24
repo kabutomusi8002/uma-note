@@ -307,6 +307,7 @@ describe("Supabase race adapter", () => {
             race_number: 12,
             starts_at: "2026-07-20T16:05:00+09:00",
             name: "ロック証跡往復",
+            data_scope: "demo",
           },
           prediction: {
             rule_version_id: null,
@@ -364,7 +365,7 @@ describe("Supabase race adapter", () => {
         course: "函館",
         raceNumber: 12,
         startTime: "16:05",
-        dataScope: "test",
+        dataScope: "demo",
       },
       prediction: {
         selectedHorses: [
@@ -379,5 +380,49 @@ describe("Supabase race adapter", () => {
     });
     const restored = parseRace(exportRace(race));
     expect(restored.lock.lockedSnapshot).toEqual(race.lock.lockedSnapshot);
+  });
+
+  it("falls back to the current race scope for a legacy canonical snapshot", () => {
+    const race = databaseRecordToRace({
+      id: "58d13b92-4e17-43e5-8eb5-3e94b70c1c3d",
+      client_key: "legacy-locked-client-race",
+      meeting: {
+        meeting_date: "2026-07-21",
+        racecourse: { code: "HAKODATE", name_ja: "函館" },
+      },
+      race: {
+        race_number: 10,
+        data_scope: "test",
+        starts_at: "2026-07-21T15:30:00+09:00",
+        name: "旧ロックスナップショット",
+      },
+      entries: [],
+      prediction: {
+        status: "locked",
+        effective_status: "locked",
+        locked_at: "2026-07-21T06:20:00.000Z",
+        selections: [],
+        revisions: [],
+        locked_snapshot: {
+          schema_version: 1,
+          race: {
+            id: "58d13b92-4e17-43e5-8eb5-3e94b70c1c3d",
+            racecourse: { code: "HAKODATE", name_ja: "函館" },
+            meeting_date: "2026-07-21",
+            race_number: 10,
+            starts_at: "2026-07-21T15:30:00+09:00",
+            name: "旧ロックスナップショット",
+          },
+          prediction: {},
+          horse_selections: [],
+          proposal_slips: [],
+        },
+      },
+      bet_slips: [],
+      result: null,
+      reflection: null,
+    });
+
+    expect(race.lock.lockedSnapshot?.race.dataScope).toBe("test");
   });
 });

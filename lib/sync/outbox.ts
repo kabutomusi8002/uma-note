@@ -14,6 +14,7 @@ export interface CreateMutationInput<T = unknown> {
   payload: T | null;
   baseSnapshot?: unknown | null;
   expectedVersion?: number | null;
+  expectedParentVersion?: number | null;
 }
 
 export interface MutationFactoryOptions {
@@ -52,7 +53,7 @@ export function createOutboxMutation<T>(
 ): OutboxMutation<T> {
   const now = (options.now ?? (() => new Date()))();
   const timestamp = now.toISOString();
-  return {
+  const mutation: OutboxMutation<T> = {
     mutationId: (options.randomUUID ?? createMutationId)(),
     ownerScope: input.ownerScope,
     entityType: input.entityType,
@@ -67,6 +68,10 @@ export function createOutboxMutation<T>(
     createdAt: timestamp,
     updatedAt: timestamp,
   };
+  if (input.expectedParentVersion !== undefined) {
+    mutation.expectedParentVersion = input.expectedParentVersion;
+  }
+  return mutation;
 }
 
 export function ownerScopeForUser(userId: string): OwnerScope {
@@ -121,7 +126,8 @@ export function coalesceOutboxMutation<T>(
     operation: incoming.operation,
     payload: incoming.payload,
     // Keep the original base/version. The combined mutation represents edits
-    // that started from that same server observation.
+    // that started from that same server observation. The optional parent
+    // precondition is retained by the spread for the same reason.
     status: "pending",
     attempts: 0,
     nextAttemptAt: incoming.nextAttemptAt,

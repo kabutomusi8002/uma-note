@@ -49,6 +49,8 @@ export interface OutboxMutation<T = unknown> {
   payload: T | null;
   baseSnapshot: unknown | null;
   expectedVersion: number | null;
+  /** Optional optimistic version of a parent aggregate, such as a rule set. */
+  expectedParentVersion?: number | null;
   status: OutboxStatus;
   attempts: number;
   nextAttemptAt: string;
@@ -80,7 +82,9 @@ export interface SyncConflict {
   entityType: SyncEntityType;
   entityKey: string;
   expectedVersion: number | null;
+  expectedParentVersion?: number | null;
   remoteVersion: number;
+  remoteParentVersion?: number;
   baseSnapshot: unknown | null;
   localSnapshot: unknown | null;
   remoteSnapshot: unknown | null;
@@ -122,11 +126,13 @@ export type PushResult =
   | {
       status: "applied";
       cloudVersion: number;
+      cloudParentVersion?: number;
       serverValue?: unknown;
     }
   | {
       status: "conflict";
       cloudVersion: number;
+      cloudParentVersion?: number;
       serverValue: unknown | null;
     }
   | {

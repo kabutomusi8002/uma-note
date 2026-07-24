@@ -36,6 +36,7 @@ export interface LocalMigrationRuleInput {
   rule: PredictionRuleVersion;
   clientKey: string;
   expectedVersion: number;
+  expectedRuleSetVersion?: number;
 }
 
 export interface LocalMigrationConflict {
@@ -91,12 +92,20 @@ export async function applyTrustedLocalMigration(
         change_source: "local_migration",
       },
     })),
-    rules: input.rules.map(({ rule, clientKey, expectedVersion }) => ({
+    rules: input.rules.map(({
+      rule,
+      clientKey,
+      expectedVersion,
+      expectedRuleSetVersion,
+    }) => ({
       client_key: clientKey,
       expected_version: expectedVersion,
       payload: {
         ...ruleToSyncPayload({ ...rule, id: clientKey }),
         client_key: clientKey,
+        ...(expectedRuleSetVersion === undefined
+          ? {}
+          : { expected_rule_set_version: expectedRuleSetVersion }),
       },
     })),
   };

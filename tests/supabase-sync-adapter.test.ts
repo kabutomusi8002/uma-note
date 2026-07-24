@@ -204,7 +204,58 @@ describe("Supabase Outbox adapter", () => {
         semantic_version: rule.version,
         content: rule.rules.join("\n"),
         parameters: { display_name: rule.name, rules: rule.rules },
-        rule_set: { name: rule.name, is_active: true },
+        rule_set: {
+          id: "66666666-6666-4666-8666-666666666666",
+          name: rule.name,
+          is_active: true,
+          sync_version: 7,
+        },
+        created_at: rule.createdAt,
+      },
+      version: 1,
+      rule_set_version: 7,
+      change_seq: 2,
+    });
+    const mutation = createOutboxMutation(
+      {
+        ownerScope: "user:44444444-4444-4444-8444-444444444444",
+        entityType: "rule",
+        entityKey: rule.id,
+        payload: rule,
+        expectedVersion: 0,
+        expectedParentVersion: 6,
+      },
+      { randomUUID: () => MUTATION_ID },
+    );
+
+    await expect(pushOutboxMutation(client, mutation, INSTALLATION_ID)).resolves.toMatchObject({
+      status: "applied",
+      cloudVersion: 1,
+      cloudParentVersion: 7,
+    });
+    expect(rpc).toHaveBeenCalledWith("sync_rule_version", expect.objectContaining({
+      p_payload: expect.objectContaining({
+        client_key: rule.id,
+        semantic_version: rule.version,
+        content: rule.rules.join("\n"),
+        expected_rule_set_version: 6,
+      }),
+      p_expected_version: 0,
+    }));
+  });
+
+  it("omits the optional rule-set precondition for legacy Outbox entries", async () => {
+    const rule = structuredClone(DEMO_RULE_VERSION);
+    const { client, rpc } = clientWithResponse({
+      status: "applied",
+      record: {
+        id: "55555555-5555-4555-8555-555555555555",
+        client_key: rule.id,
+        sync_version: 1,
+        semantic_version: rule.version,
+        content: rule.rules.join("\n"),
+        parameters: { display_name: rule.name, rules: rule.rules },
+        rule_set: { name: rule.name, is_active: false },
         created_at: rule.createdAt,
       },
       version: 1,
@@ -221,17 +272,57 @@ describe("Supabase Outbox adapter", () => {
       { randomUUID: () => MUTATION_ID },
     );
 
-    await expect(pushOutboxMutation(client, mutation, INSTALLATION_ID)).resolves.toMatchObject({
-      status: "applied",
-      cloudVersion: 1,
+    await pushOutboxMutation(client, mutation, INSTALLATION_ID);
+
+    const rpcArguments = rpc.mock.calls[0]?.[1] as {
+      p_payload?: Record<string, unknown>;
+    };
+    expect(rpcArguments.p_payload).not.toHaveProperty("expected_rule_set_version");
+  });
+
+  it("keeps a replayed rule-set version conflict as a conflict", async () => {
+    const rule = structuredClone(DEMO_RULE_VERSION);
+    const current = {
+      id: "55555555-5555-4555-8555-555555555555",
+      client_key: rule.id,
+      sync_version: 4,
+      semantic_version: rule.version,
+      content: rule.rules.join("\n"),
+      parameters: { display_name: rule.name, rules: rule.rules },
+      rule_set: {
+        id: "66666666-6666-4666-8666-666666666666",
+        name: rule.name,
+        is_active: false,
+        sync_version: 6,
+      },
+      created_at: rule.createdAt,
+    };
+    const { client } = clientWithResponse({
+      status: "conflict",
+      replayed: true,
+      current,
+      current_version: 4,
+      current_rule_set_version: 6,
+      reason: "rule_set_version_mismatch",
     });
-    expect(rpc).toHaveBeenCalledWith("sync_rule_version", expect.objectContaining({
-      p_payload: expect.objectContaining({
-        client_key: rule.id,
-        semantic_version: rule.version,
-        content: rule.rules.join("\n"),
-      }),
-    }));
+    const mutation = createOutboxMutation(
+      {
+        ownerScope: "user:44444444-4444-4444-8444-444444444444",
+        entityType: "rule",
+        entityKey: rule.id,
+        payload: rule,
+        expectedVersion: 3,
+        expectedParentVersion: 5,
+      },
+      { randomUUID: () => MUTATION_ID },
+    );
+
+    await expect(pushOutboxMutation(client, mutation, INSTALLATION_ID)).resolves.toMatchObject({
+      status: "conflict",
+      cloudVersion: 4,
+      cloudParentVersion: 6,
+      serverValue: { id: rule.id },
+    });
   });
 
   it("syncs user settings without placing a user_id in the browser payload", async () => {
@@ -283,7 +374,12 @@ describe("Supabase Outbox adapter", () => {
         semantic_version: rule.version,
         content: rule.rules.join("\n"),
         parameters: { display_name: rule.name, rules: rule.rules },
-        rule_set: { name: rule.name, is_active: true },
+        rule_set: {
+          id: "66666666-6666-4666-8666-666666666666",
+          name: rule.name,
+          is_active: true,
+          sync_version: 9,
+        },
         created_at: rule.createdAt,
       }],
       settings: {
@@ -298,7 +394,12 @@ describe("Supabase Outbox adapter", () => {
     const bootstrap = await loadSyncBootstrap(client);
 
     expect(bootstrap.races[0]).toMatchObject({ clientKey: race.id, version: 6 });
-    expect(bootstrap.rules[0]).toMatchObject({ clientKey: rule.id, version: 3 });
+    expect(bootstrap.rules[0]).toMatchObject({
+      clientKey: rule.id,
+      version: 3,
+      parentCloudId: "66666666-6666-4666-8666-666666666666",
+      parentVersion: 9,
+    });
     expect(bootstrap.settings).toMatchObject({
       clientKey: "profile",
       version: 2,

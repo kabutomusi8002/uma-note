@@ -190,13 +190,14 @@ export function createSyncConflict(
   remoteSnapshot: unknown | null,
   remoteVersion: number,
   now: Date = new Date(),
+  remoteParentVersion?: number,
 ): SyncConflict {
   const analysis = reconcileEntity(
     mutation.baseSnapshot,
     mutation.payload,
     remoteSnapshot,
   );
-  return {
+  const conflict: SyncConflict = {
     conflictId: `${mutation.ownerScope}:${mutation.entityType}:${mutation.entityKey}:${mutation.mutationId}`,
     mutationId: mutation.mutationId,
     ownerScope: mutation.ownerScope,
@@ -212,6 +213,13 @@ export function createSyncConflict(
     status: "unresolved",
     createdAt: now.toISOString(),
   };
+  if (mutation.expectedParentVersion !== undefined) {
+    conflict.expectedParentVersion = mutation.expectedParentVersion;
+  }
+  if (remoteParentVersion !== undefined) {
+    conflict.remoteParentVersion = remoteParentVersion;
+  }
+  return conflict;
 }
 
 export { DEFAULT_ATOMIC_PATHS };

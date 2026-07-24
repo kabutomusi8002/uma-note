@@ -89,6 +89,7 @@ export async function pushOutboxMutation(
     }
     const result = await syncRuleVersion(client, mutation.payload, {
       expectedVersion,
+      expectedParentVersion: mutation.expectedParentVersion,
       mutationId: mutation.mutationId,
       installationId,
       activate: mutation.payload.isActive,
@@ -98,12 +99,18 @@ export async function pushOutboxMutation(
       return {
         status: "conflict",
         cloudVersion: result.currentVersion,
+        ...(result.currentParentVersion === undefined
+          ? {}
+          : { cloudParentVersion: result.currentParentVersion }),
         serverValue: result.current ?? null,
       };
     }
     return {
       status: "applied",
       cloudVersion: result.version,
+      ...(result.parentVersion === undefined
+        ? {}
+        : { cloudParentVersion: result.parentVersion }),
       serverValue: result.rule,
     };
   }

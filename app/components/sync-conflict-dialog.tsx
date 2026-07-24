@@ -111,6 +111,16 @@ export function SyncConflictDialog({
             <dt>競合箇所</dt>
             <dd>{conflict.fields.length}件</dd>
           </div>
+          {conflict.expectedParentVersion !== undefined ||
+          conflict.remoteParentVersion !== undefined ? (
+            <div>
+              <dt>親ルールセット版</dt>
+              <dd>
+                端末基準 v{conflict.expectedParentVersion ?? "未取得"} / クラウド v
+                {conflict.remoteParentVersion ?? "未取得"}
+              </dd>
+            </div>
+          ) : null}
         </dl>
 
         <section className="sync-conflict-fields" aria-labelledby={`${titleId}-fields`}>

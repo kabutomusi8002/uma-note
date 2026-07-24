@@ -9,6 +9,7 @@ import { createSyncCoordinator } from "../lib/sync/coordinator";
 import {
   calculateRetryDelay,
   classifySyncError,
+  coalesceOutboxMutation,
   createOutboxMutation,
   isMutationDue,
   isOwnerAuthorized,
@@ -79,6 +80,36 @@ describe("outbox policy", () => {
     expect(retry.nextAttemptAt).toBe("2026-07-18T00:00:02.000Z");
     expect(isMutationDue(retry, new Date("2026-07-18T00:00:01.999Z"))).toBe(false);
     expect(isMutationDue(retry, new Date("2026-07-18T00:00:02.000Z"))).toBe(true);
+  });
+
+  it("preserves both original optimistic preconditions while coalescing", () => {
+    const existing = {
+      ...mutation(),
+      expectedParentVersion: 6,
+    };
+    const incoming = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: "race-a",
+        payload: { prediction: { note: "newer phone edit" } },
+        baseSnapshot: { prediction: { note: "newer base" } },
+        expectedVersion: 8,
+        expectedParentVersion: 9,
+      },
+      {
+        now: () => new Date("2026-07-18T00:01:00.000Z"),
+        randomUUID: () => "mutation-b",
+      },
+    );
+
+    expect(coalesceOutboxMutation(existing, incoming)).toMatchObject({
+      mutationId: "mutation-a",
+      expectedVersion: 4,
+      expectedParentVersion: 6,
+      payload: { prediction: { note: "newer phone edit" } },
+      baseSnapshot: { prediction: { note: "base" } },
+    });
   });
 
   it("never authorizes another user's or anonymous workspace", () => {
@@ -179,10 +210,14 @@ describe("sync coordinator", () => {
 
   it("stores a visible conflict and does not overwrite or discard local data", async () => {
     const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
-    await enqueueMutation(database, mutation());
+    await enqueueMutation(database, {
+      ...mutation(),
+      expectedParentVersion: 2,
+    });
     const push = vi.fn(async (): Promise<PushResult> => ({
       status: "conflict",
       cloudVersion: 5,
+      cloudParentVersion: 3,
       serverValue: { prediction: { note: "desktop" } },
     }));
     const coordinator = createSyncCoordinator({
@@ -206,6 +241,8 @@ describe("sync coordinator", () => {
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0]).toMatchObject({
       remoteVersion: 5,
+      expectedParentVersion: 2,
+      remoteParentVersion: 3,
       reconciliation: "conflict",
       status: "unresolved",
     });

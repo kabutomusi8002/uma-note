@@ -84,6 +84,23 @@ describe("UMA_NOTE_BACKUP/1", () => {
     );
   });
 
+  it("preserves the lock-time scope through backup and restore", async () => {
+    const locked = upgradeLegacyPredictionLock(createDemoRace());
+    const lockTimeScope = locked.lock.lockedSnapshot?.race.dataScope;
+    const current = { ...locked, dataScope: "test" as const };
+    const backup = await createLocalBackup({
+      races: [current],
+      rules: [ACTIVE_RULE],
+      createdAt: "2026-07-18T00:00:00.000Z",
+    });
+
+    const restored = await parseLocalBackup(backup.text);
+    expect(restored.races[0]?.dataScope).toBe("test");
+    expect(
+      restored.races[0]?.lock.lockedSnapshot?.race.dataScope,
+    ).toBe(lockTimeScope);
+  });
+
   it("オブジェクトのキー挿入順に依存しないcanonical JSONとハッシュを作る", async () => {
     const left = await createLocalBackup({
       races: [createDemoRace()],

@@ -292,6 +292,7 @@ export function createSyncCoordinator(
             result.serverValue,
             result.cloudVersion,
             now(),
+            result.cloudParentVersion,
           );
           await putConflict(options.database, conflict);
           await updateOutbox(options.database, inFlight.mutationId, {

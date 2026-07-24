@@ -87,6 +87,7 @@ describe("three-way reconciliation", () => {
         payload: { note: "phone" },
         baseSnapshot: { note: "base" },
         expectedVersion: 7,
+        expectedParentVersion: 11,
       },
       {
         now: () => new Date("2026-07-18T00:00:00.000Z"),
@@ -98,13 +99,16 @@ describe("three-way reconciliation", () => {
       { note: "desktop" },
       8,
       new Date("2026-07-18T00:01:00.000Z"),
+      12,
     );
 
     expect(conflict).toMatchObject({
       conflictId: "user:user-a:race:race-a:mutation-a",
       mutationId: "mutation-a",
       expectedVersion: 7,
+      expectedParentVersion: 11,
       remoteVersion: 8,
+      remoteParentVersion: 12,
       reconciliation: "conflict",
       status: "unresolved",
     });

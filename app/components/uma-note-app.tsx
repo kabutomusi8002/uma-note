@@ -366,6 +366,10 @@ function syncEntityKey(entityType: OutboxMutation["entityType"], entityKey: stri
   return `${entityType}:${entityKey}`;
 }
 
+function ruleSetSyncKey(rule: Pick<PredictionRuleVersion, "name">): string {
+  return rule.name.trim();
+}
+
 function ruleSemanticValue(rule: PredictionRuleVersion): unknown {
   return {
     name: rule.name,
@@ -446,6 +450,7 @@ export function UmaNoteApp() {
     { userId: string; bootstrap: SyncBootstrap }
   >());
   const cloudVersionsRef = useRef(new Map<string, number>());
+  const cloudRuleSetVersionsRef = useRef(new Map<string, number>());
   const cloudBaseSnapshotsRef = useRef(new Map<string, unknown>());
   const cloudRaceByNaturalKeyRef = useRef(new Map<
     string,
@@ -555,6 +560,7 @@ export function UmaNoteApp() {
             userSettings: settings,
             cloudSync: {
               versions: Object.fromEntries(cloudVersionsRef.current),
+              ruleSetVersions: Object.fromEntries(cloudRuleSetVersionsRef.current),
               bases: Object.fromEntries(cloudBaseSnapshotsRef.current),
             },
           },
@@ -628,6 +634,7 @@ export function UmaNoteApp() {
       : (nextRaces[0]?.id ?? "");
 
     cloudVersionsRef.current.clear();
+    cloudRuleSetVersionsRef.current.clear();
     cloudBaseSnapshotsRef.current.clear();
     cloudRaceByNaturalKeyRef.current.clear();
     cloudRaceAliasesRef.current.clear();
@@ -642,6 +649,18 @@ export function UmaNoteApp() {
         )) {
           if (typeof value === "number" && Number.isFinite(value)) {
             cloudVersionsRef.current.set(key, value);
+          }
+        }
+      }
+      if (
+        metadata.ruleSetVersions !== null &&
+        typeof metadata.ruleSetVersions === "object"
+      ) {
+        for (const [key, value] of Object.entries(
+          metadata.ruleSetVersions as Record<string, unknown>,
+        )) {
+          if (typeof value === "number" && Number.isFinite(value)) {
+            cloudRuleSetVersionsRef.current.set(key, value);
           }
         }
       }
@@ -874,16 +893,30 @@ export function UmaNoteApp() {
             const versions = cloudSync.versions !== null && typeof cloudSync.versions === "object"
               ? { ...(cloudSync.versions as Record<string, unknown>) }
               : {};
+            const ruleSetVersions =
+              cloudSync.ruleSetVersions !== null &&
+              typeof cloudSync.ruleSetVersions === "object"
+                ? { ...(cloudSync.ruleSetVersions as Record<string, unknown>) }
+                : {};
             const bases = cloudSync.bases !== null && typeof cloudSync.bases === "object"
               ? { ...(cloudSync.bases as Record<string, unknown>) }
               : {};
             versions[key] = result.cloudVersion;
+            if (
+              mutation.entityType === "rule" &&
+              result.cloudParentVersion !== undefined &&
+              mutation.payload
+            ) {
+              ruleSetVersions[
+                ruleSetSyncKey(mutation.payload as PredictionRuleVersion)
+              ] = result.cloudParentVersion;
+            }
             if (result.serverValue !== undefined) bases[key] = result.serverValue;
             await replaceWorkspace(localDatabase, {
               ...workspace,
               settings: {
                 ...workspace.settings,
-                cloudSync: { versions, bases },
+                cloudSync: { versions, ruleSetVersions, bases },
               },
               updatedAt: new Date().toISOString(),
             });
@@ -891,6 +924,16 @@ export function UmaNoteApp() {
           return;
         }
         cloudVersionsRef.current.set(key, result.cloudVersion);
+        if (
+          mutation.entityType === "rule" &&
+          result.cloudParentVersion !== undefined &&
+          mutation.payload
+        ) {
+          cloudRuleSetVersionsRef.current.set(
+            ruleSetSyncKey(mutation.payload as PredictionRuleVersion),
+            result.cloudParentVersion,
+          );
+        }
         if (result.serverValue !== undefined) {
           cloudBaseSnapshotsRef.current.set(key, result.serverValue);
         }
@@ -916,6 +959,7 @@ export function UmaNoteApp() {
             userSettings: settingsRef.current,
             cloudSync: {
               versions: Object.fromEntries(cloudVersionsRef.current),
+              ruleSetVersions: Object.fromEntries(cloudRuleSetVersionsRef.current),
               bases: Object.fromEntries(cloudBaseSnapshotsRef.current),
             },
           },
@@ -987,6 +1031,7 @@ export function UmaNoteApp() {
             userSettings: settingsRef.current,
             cloudSync: {
               versions: Object.fromEntries(cloudVersionsRef.current),
+              ruleSetVersions: Object.fromEntries(cloudRuleSetVersionsRef.current),
               bases: Object.fromEntries(cloudBaseSnapshotsRef.current),
             },
           },
@@ -1041,6 +1086,8 @@ export function UmaNoteApp() {
       payload: syncPayload,
       baseSnapshot: cloudBaseSnapshotsRef.current.get(key) ?? null,
       expectedVersion: cloudVersionsRef.current.get(key) ?? 0,
+      expectedParentVersion:
+        cloudRuleSetVersionsRef.current.get(ruleSetSyncKey(rule)) ?? 0,
     }));
   }, [enqueueDurableMutation]);
 
@@ -1147,8 +1194,10 @@ export function UmaNoteApp() {
     assertCurrentCloudOperation();
     const previousBases = new Map(cloudBaseSnapshotsRef.current);
     const previousVersions = new Map(cloudVersionsRef.current);
+    const previousRuleSetVersions = new Map(cloudRuleSetVersionsRef.current);
     const nextCloudBases = new Map(cloudBaseSnapshotsRef.current);
     const nextCloudVersions = new Map(cloudVersionsRef.current);
+    const nextCloudRuleSetVersions = new Map(cloudRuleSetVersionsRef.current);
     const nextCloudRaceAliases = new Map(cloudRaceAliasesRef.current);
     const nextCloudRuleAliases = new Map(cloudRuleAliasesRef.current);
     const nextCloudRaceByNaturalKey = new Map<
@@ -1169,6 +1218,12 @@ export function UmaNoteApp() {
     }
     for (const record of bootstrap.rules) {
       nextCloudRuleByIdentity.set(ruleIdentityKey(record.value), record);
+      if (record.parentVersion !== undefined) {
+        nextCloudRuleSetVersions.set(
+          ruleSetSyncKey(record.value),
+          record.parentVersion,
+        );
+      }
     }
 
     const pending = await listOutbox(database, ownerScope);
@@ -1194,11 +1249,18 @@ export function UmaNoteApp() {
       mutation: OutboxMutation,
       remote: unknown | null,
       remoteVersion: number,
+      remoteParentVersion?: number,
     ) => {
       if (conflictMutationIds.has(mutation.mutationId)) return;
       await putConflict(
         database,
-        createSyncConflict(mutation, remote, remoteVersion),
+        createSyncConflict(
+          mutation,
+          remote,
+          remoteVersion,
+          new Date(),
+          remoteParentVersion,
+        ),
       );
       if (pending.some((item) => item.mutationId === mutation.mutationId)) {
         await updateOutbox(database, mutation.mutationId, {
@@ -1307,8 +1369,15 @@ export function UmaNoteApp() {
         payload: localForSync,
         baseSnapshot: previousBase ?? null,
         expectedVersion: previousVersions.get(key) ?? 0,
+        expectedParentVersion:
+          previousRuleSetVersions.get(ruleSetSyncKey(localForSync)) ?? 0,
       });
-      await recordConflict(mutation, remote.value, remote.version);
+      await recordConflict(
+        mutation,
+        remote.value,
+        remote.version,
+        remote.parentVersion,
+      );
     }
 
     if (bootstrap.settings) {
@@ -1344,6 +1413,7 @@ export function UmaNoteApp() {
 
     assertCurrentCloudOperation();
     cloudVersionsRef.current = nextCloudVersions;
+    cloudRuleSetVersionsRef.current = nextCloudRuleSetVersions;
     cloudBaseSnapshotsRef.current = nextCloudBases;
     cloudRaceAliasesRef.current = nextCloudRaceAliases;
     cloudRuleAliasesRef.current = nextCloudRuleAliases;
@@ -1369,6 +1439,7 @@ export function UmaNoteApp() {
         userSettings: nextSettings,
         cloudSync: {
           versions: Object.fromEntries(nextCloudVersions),
+          ruleSetVersions: Object.fromEntries(nextCloudRuleSetVersions),
           bases: Object.fromEntries(nextCloudBases),
         },
       },
@@ -1564,9 +1635,30 @@ export function UmaNoteApp() {
         expectedVersion: remote?.version ?? 0,
       };
     });
+    const plannedRuleSetVersions = new Map<string, number>();
+    for (const remoteRule of preview.rules) {
+      if (remoteRule.parentVersion !== undefined) {
+        plannedRuleSetVersions.set(
+          ruleSetSyncKey(remoteRule.value),
+          remoteRule.parentVersion,
+        );
+      }
+    }
     const ruleInputs = selectedRules.map((rule) => {
       const remote = preview.rules.find(
         (candidate) => ruleIdentityKey(candidate.value) === ruleIdentityKey(rule),
+      );
+      const remoteRuleSet = remote ?? preview.rules.find(
+        (candidate) => ruleSetSyncKey(candidate.value) === ruleSetSyncKey(rule),
+      );
+      const ruleSetKey = ruleSetSyncKey(rule);
+      const expectedRuleSetVersion =
+        plannedRuleSetVersions.get(ruleSetKey) ??
+        remoteRuleSet?.parentVersion ??
+        0;
+      plannedRuleSetVersions.set(
+        ruleSetKey,
+        expectedRuleSetVersion === 0 ? 1 : expectedRuleSetVersion + 1,
       );
       const clientKey = remote?.clientKey ?? rule.id;
       if (remote) cloudRuleAliasesRef.current.set(rule.id, clientKey);
@@ -1574,6 +1666,7 @@ export function UmaNoteApp() {
         rule,
         clientKey,
         expectedVersion: remote?.version ?? 0,
+        expectedRuleSetVersion,
       };
     });
     const attemptKey = `${userId}:${backup.sha256}:${planHash}`;
@@ -1644,6 +1737,7 @@ export function UmaNoteApp() {
           migrationBackupHash: backup.sha256,
           cloudSync: {
             versions: Object.fromEntries(cloudVersionsRef.current),
+            ruleSetVersions: Object.fromEntries(cloudRuleSetVersionsRef.current),
             bases: Object.fromEntries(cloudBaseSnapshotsRef.current),
           },
         },
@@ -1764,6 +1858,22 @@ export function UmaNoteApp() {
     }
     const key = syncEntityKey(conflict.entityType, conflict.entityKey);
     cloudVersionsRef.current.set(key, conflict.remoteVersion);
+    if (
+      conflict.entityType === "rule" &&
+      conflict.remoteParentVersion !== undefined
+    ) {
+      const versionedRule = isRuleVersionArray([remote])
+        ? remote as PredictionRuleVersion
+        : isRuleVersionArray([conflict.localSnapshot])
+          ? conflict.localSnapshot as PredictionRuleVersion
+          : null;
+      if (versionedRule) {
+        cloudRuleSetVersionsRef.current.set(
+          ruleSetSyncKey(versionedRule),
+          conflict.remoteParentVersion,
+        );
+      }
+    }
     cloudBaseSnapshotsRef.current.set(key, remote);
     racesRef.current = nextRaces;
     rulesRef.current = nextRules;
@@ -1782,6 +1892,7 @@ export function UmaNoteApp() {
         userSettings: nextSettings,
         cloudSync: {
           versions: Object.fromEntries(cloudVersionsRef.current),
+          ruleSetVersions: Object.fromEntries(cloudRuleSetVersionsRef.current),
           bases: Object.fromEntries(cloudBaseSnapshotsRef.current),
         },
       },
@@ -1804,6 +1915,9 @@ export function UmaNoteApp() {
       payload: conflict.localSnapshot,
       baseSnapshot: conflict.remoteSnapshot,
       expectedVersion: conflict.remoteVersion,
+      ...(conflict.remoteParentVersion === undefined
+        ? {}
+        : { expectedParentVersion: conflict.remoteParentVersion }),
     });
     await markConflictResolved(conflict, "local", successor);
     await refreshSyncState(conflict.ownerScope);
@@ -2617,6 +2731,14 @@ function PredictionEditor({
           <span aria-hidden="true">◇</span>
           <div><strong>発走前予想は固定されています</strong><small>{race.lock.lockedAt ? `${new Date(race.lock.lockedAt).toLocaleString("ja-JP")} にロック` : "発走時刻を過ぎたため編集できません"}</small></div>
         </div>
+      )}
+      {locked && race.lock.lockedSnapshot && (
+        <p className="subtle-note">
+          ロック時区分:{" "}
+          {RACE_DATA_SCOPE_LABELS[
+            race.lock.lockedSnapshot.race.dataScope ?? "live"
+          ]}
+        </p>
       )}
 
       <div className="editor-columns">

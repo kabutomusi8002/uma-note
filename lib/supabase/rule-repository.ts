@@ -18,6 +18,14 @@ function booleanValue(value: unknown): boolean {
   return value === true;
 }
 
+function relatedRuleSet(row: JsonObject): JsonObject {
+  if (row.rule_set) return object(row.rule_set);
+  if (Array.isArray(row.prediction_rule_sets)) {
+    return object(row.prediction_rule_sets[0]);
+  }
+  return object(row.prediction_rule_sets);
+}
+
 function rulesFrom(value: unknown, content: string): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")
@@ -27,11 +35,7 @@ function rulesFrom(value: unknown, content: string): string[] {
 export function databaseRecordToRule(raw: unknown): PredictionRuleVersion {
   const row = object(raw);
   const parameters = object(row.parameters);
-  const joined = row.rule_set
-    ? object(row.rule_set)
-    : Array.isArray(row.prediction_rule_sets)
-    ? object(row.prediction_rule_sets[0])
-    : object(row.prediction_rule_sets);
+  const joined = relatedRuleSet(row);
   const content = text(row.content);
   return {
     id: text(row.client_key, text(row.id)),
@@ -53,7 +57,7 @@ export async function loadRuleVersions(
   const { data, error } = await client
     .from("prediction_rule_versions")
     .select(
-      "id, client_key, sync_version, semantic_version, version_number, content, parameters, change_note, created_at, prediction_rule_sets!inner(name, description, is_active)",
+      "id, client_key, sync_version, semantic_version, version_number, content, parameters, change_note, created_at, prediction_rule_sets!inner(id, name, description, is_active, sync_version, updated_at)",
     )
     .order("created_at", { ascending: false });
   if (error) throw repositoryError("予想ルールの読み込みに失敗しました", error);
@@ -66,6 +70,7 @@ export type RuleSyncResult =
       rule: PredictionRuleVersion;
       cloudId: string;
       version: number;
+      parentVersion?: number;
       changeSequence: number;
     }
   | {
@@ -73,10 +78,15 @@ export type RuleSyncResult =
       reason: string;
       current: PredictionRuleVersion | null;
       currentVersion: number;
+      currentParentVersion?: number;
     };
 
 function numberValue(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function optionalNumberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 export function ruleToSyncPayload(rule: PredictionRuleVersion): JsonObject {
@@ -97,17 +107,25 @@ export async function syncRuleVersion(
   rule: PredictionRuleVersion,
   options: {
     expectedVersion: number;
+    expectedParentVersion?: number | null;
     mutationId: string;
     installationId: string;
     activate?: boolean;
     signal?: AbortSignal;
   },
 ): Promise<RuleSyncResult> {
+  const payload: JsonObject = {
+    ...ruleToSyncPayload(rule),
+    is_active: options.activate ?? rule.isActive,
+  };
+  if (
+    options.expectedParentVersion !== undefined &&
+    options.expectedParentVersion !== null
+  ) {
+    payload.expected_rule_set_version = options.expectedParentVersion;
+  }
   const request = client.rpc("sync_rule_version", {
-    p_payload: {
-      ...ruleToSyncPayload(rule),
-      is_active: options.activate ?? rule.isActive,
-    },
+    p_payload: payload,
     p_expected_version: options.expectedVersion,
     p_mutation_id: options.mutationId,
     p_installation_id: options.installationId,
@@ -121,6 +139,12 @@ export async function syncRuleVersion(
     const currentRecord = response.current === null || response.current === undefined
       ? null
       : object(response.current);
+    const currentRuleSet = currentRecord
+      ? relatedRuleSet(currentRecord)
+      : object(response.current_rule_set);
+    const currentParentVersion =
+      optionalNumberValue(response.current_rule_set_version) ??
+      optionalNumberValue(currentRuleSet.sync_version);
     return {
       status: "conflict",
       reason: text(response.reason, "クラウド側のルールが変更されています。"),
@@ -129,14 +153,21 @@ export async function syncRuleVersion(
         currentRecord?.sync_version,
         numberValue(response.current_version),
       ),
+      ...(currentParentVersion === undefined
+        ? {}
+        : { currentParentVersion }),
     };
   }
   const record = object(response.record ?? data);
+  const parentVersion =
+    optionalNumberValue(response.rule_set_version) ??
+    optionalNumberValue(relatedRuleSet(record).sync_version);
   return {
     status: text(response.status) === "replayed" ? "replayed" : "applied",
     rule: databaseRecordToRule(record),
     cloudId: text(response.entity_id, text(record.id)),
     version: numberValue(response.version, numberValue(record.sync_version)),
+    ...(parentVersion === undefined ? {} : { parentVersion }),
     changeSequence: numberValue(response.change_seq),
   };
 }

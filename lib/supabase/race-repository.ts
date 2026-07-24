@@ -269,6 +269,10 @@ function lockedSnapshotFromDatabase(
   const prediction = object(snapshot.prediction);
   const selections = array(snapshot.horse_selections).map(object);
   const startsAt = text(race.starts_at);
+  const storedDataScope = text(race.data_scope) as RaceDataScope;
+  const lockedDataScope = RACE_DATA_SCOPES.includes(storedDataScope)
+    ? storedDataScope
+    : context.dataScope;
   const selectedHorses = selections
     .filter((selection) => MARK_FROM_DATABASE[text(selection.mark)])
     .map((selection) => ({
@@ -305,7 +309,7 @@ function lockedSnapshotFromDatabase(
       raceNumber: numberValue(race.race_number),
       startTime: startTimeInJapan(startsAt),
       name: text(race.name, "名称未設定レース"),
-      dataScope: context.dataScope,
+      dataScope: lockedDataScope,
     },
     prediction: mappedPrediction,
     proposedBets: array(snapshot.proposal_slips)
