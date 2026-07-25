@@ -4,6 +4,11 @@ import type {
   SyncConflict,
   WorkspaceSnapshot,
 } from "../sync/types";
+import type { RaceRecord } from "../types";
+import {
+  backfillRaceClientKey,
+  raceNaturalKey,
+} from "../race-identity";
 import {
   canCoalesceMutation,
   coalesceOutboxMutation,
@@ -82,6 +87,109 @@ function clone<T>(value: T): T {
     return globalThis.structuredClone(value);
   }
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+type LegacyRaceRecord = Omit<RaceRecord, "clientKey"> & {
+  clientKey?: unknown;
+};
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+function safeRaceNaturalKey(value: unknown): string | null {
+  const record = objectValue(value);
+  if (
+    !record ||
+    typeof record.date !== "string" ||
+    typeof record.course !== "string" ||
+    (typeof record.raceNumber !== "number" &&
+      typeof record.raceNumber !== "string")
+  ) {
+    return null;
+  }
+  try {
+    return raceNaturalKey({
+      date: record.date,
+      course: record.course,
+      raceNumber: record.raceNumber,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function normalizeRaceOutboxMutation(
+  mutation: OutboxMutation,
+): { mutation: OutboxMutation; changed: boolean } {
+  if (mutation.entityType !== "race" || mutation.payload === null) {
+    return { mutation, changed: false };
+  }
+  const payload = objectValue(mutation.payload);
+  const payloadId = nonEmptyString(payload?.id);
+  const isCompleteRacePayload = Boolean(
+    payloadId &&
+      typeof payload?.date === "string" &&
+      typeof payload?.course === "string" &&
+      typeof payload?.raceNumber === "number",
+  );
+  if (!payload || !isCompleteRacePayload || nonEmptyString(payload.clientKey)) {
+    return { mutation, changed: false };
+  }
+  return {
+    mutation: {
+      ...mutation,
+      payload: {
+        ...payload,
+        clientKey: mutation.entityKey,
+      },
+    },
+    changed: true,
+  };
+}
+
+function matchingOutboxEntityKey(
+  race: LegacyRaceRecord,
+  mutations: readonly OutboxMutation[],
+): string | null {
+  const raceKey = safeRaceNaturalKey(race);
+  const matching = mutations
+    .filter((mutation) => {
+      if (mutation.entityType !== "race") return false;
+      const payload = objectValue(mutation.payload);
+      if (!payload) return false;
+      if (nonEmptyString(payload.id) === race.id) return true;
+      return raceKey !== null && safeRaceNaturalKey(payload) === raceKey;
+    })
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  return nonEmptyString(matching[0]?.entityKey);
+}
+
+function normalizeWorkspaceRaceClientKeys(
+  workspace: WorkspaceSnapshot,
+  mutations: readonly OutboxMutation[],
+): { workspace: WorkspaceSnapshot; changed: boolean } {
+  let changed = false;
+  const races = workspace.races.map((race) => {
+    const legacy = race as unknown as LegacyRaceRecord;
+    if (nonEmptyString(legacy.clientKey)) return race;
+    const normalized = backfillRaceClientKey(
+      legacy,
+      matchingOutboxEntityKey(legacy, mutations),
+    ) as RaceRecord;
+    changed = true;
+    return normalized;
+  });
+  return {
+    workspace: changed ? { ...workspace, races } : workspace,
+    changed,
+  };
 }
 
 function emptyState(): LocalStorageState {
@@ -611,9 +719,12 @@ async function migrateLegacyV1(
   const existing = await adapter.getWorkspace(ownerScope);
   if (!existing && (races || rules || activeRaceId)) {
     const timestamp = now().toISOString();
+    const normalizedRaces = ((races ?? []) as LegacyRaceRecord[]).map((race) =>
+      backfillRaceClientKey(race) as RaceRecord
+    );
     const workspace: WorkspaceSnapshot = {
       ownerScope,
-      races: (races ?? []) as WorkspaceSnapshot["races"],
+      races: normalizedRaces,
       rules: (rules ?? []) as WorkspaceSnapshot["rules"],
       settings: activeRaceId ? { activeRaceId } : {},
       updatedAt: timestamp,
@@ -722,7 +833,30 @@ export function getWorkspace(
   database: LocalDatabase,
   ownerScope: OwnerScope,
 ): Promise<WorkspaceSnapshot | null> {
-  return database[INTERNAL].getWorkspace(ownerScope);
+  return (async () => {
+    const adapter = database[INTERNAL];
+    const workspace = await adapter.getWorkspace(ownerScope);
+    if (!workspace) return null;
+    const storedMutations = await adapter.listOutbox(ownerScope);
+    const normalizedMutations: OutboxMutation[] = [];
+    for (const stored of storedMutations) {
+      const normalized = normalizeRaceOutboxMutation(stored);
+      normalizedMutations.push(normalized.mutation);
+      if (normalized.changed) {
+        await adapter.updateOutbox(stored.mutationId, {
+          payload: normalized.mutation.payload,
+        });
+      }
+    }
+    const normalizedWorkspace = normalizeWorkspaceRaceClientKeys(
+      workspace,
+      normalizedMutations,
+    );
+    if (normalizedWorkspace.changed) {
+      await adapter.replaceWorkspace(normalizedWorkspace.workspace, []);
+    }
+    return normalizedWorkspace.workspace;
+  })();
 }
 
 /**
@@ -737,21 +871,47 @@ export function replaceWorkspace(
   if (mutations.some((mutation) => mutation.ownerScope !== workspace.ownerScope)) {
     return Promise.reject(new Error("Workspace and outbox owner scopes must match"));
   }
-  return database[INTERNAL].replaceWorkspace(clone(workspace), clone(mutations));
+  const normalizedMutations = mutations.map(
+    (mutation) => normalizeRaceOutboxMutation(mutation).mutation,
+  );
+  const normalizedWorkspace = normalizeWorkspaceRaceClientKeys(
+    workspace,
+    normalizedMutations,
+  ).workspace;
+  return database[INTERNAL].replaceWorkspace(
+    clone(normalizedWorkspace),
+    clone(normalizedMutations),
+  );
 }
 
 export function enqueueMutation(
   database: LocalDatabase,
   mutation: OutboxMutation,
 ): Promise<OutboxMutation> {
-  return database[INTERNAL].enqueueMutation(clone(mutation));
+  return database[INTERNAL].enqueueMutation(
+    clone(normalizeRaceOutboxMutation(mutation).mutation),
+  );
 }
 
 export function listOutbox(
   database: LocalDatabase,
   ownerScope?: OwnerScope,
 ): Promise<OutboxMutation[]> {
-  return database[INTERNAL].listOutbox(ownerScope);
+  return (async () => {
+    const adapter = database[INTERNAL];
+    const stored = await adapter.listOutbox(ownerScope);
+    const normalized: OutboxMutation[] = [];
+    for (const mutation of stored) {
+      const result = normalizeRaceOutboxMutation(mutation);
+      normalized.push(result.mutation);
+      if (result.changed) {
+        await adapter.updateOutbox(mutation.mutationId, {
+          payload: result.mutation.payload,
+        });
+      }
+    }
+    return normalized;
+  })();
 }
 
 export function updateOutbox(
@@ -807,6 +967,8 @@ export function resolveConflict(
   }
   return database[INTERNAL].resolveConflict(
     clone(conflict),
-    successor ? clone(successor) : undefined,
+    successor
+      ? clone(normalizeRaceOutboxMutation(successor).mutation)
+      : undefined,
   );
 }

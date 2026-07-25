@@ -9,6 +9,8 @@ import {
 describe("Supabase race adapter", () => {
   it("expands proposed and actual plans into separate database slips", () => {
     const payload = raceToDatabasePayload(DEMO_RACE);
+    expect(payload.client_key).toBe(DEMO_RACE.clientKey);
+    expect(payload).not.toHaveProperty("id");
     expect((payload.race as { data_scope: string }).data_scope).toBe("demo");
     const slips = payload.bet_slips as Array<{
       kind: string;
@@ -21,6 +23,16 @@ describe("Supabase race adapter", () => {
     expect(
       (payload.prediction as { revisions: unknown[] }).revisions,
     ).toHaveLength(2);
+  });
+
+  it("keeps the UI id separate and sends only the persisted clientKey", () => {
+    const payload = raceToDatabasePayload({
+      ...DEMO_RACE,
+      id: "33333333-3333-4333-8333-333333333333",
+      clientKey: "stable-offline-client-key",
+    });
+    expect(payload.client_key).toBe("stable-offline-client-key");
+    expect(payload).not.toHaveProperty("id");
   });
 
   it("keeps a post-time-only lock as imported current data, not immutable evidence", () => {

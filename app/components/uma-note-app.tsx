@@ -96,7 +96,12 @@ import type {
   SyncConflict,
   SyncCoordinatorStatus,
 } from "@/lib/sync/types";
-import { assertNoDuplicateRaces, raceNaturalKey } from "@/lib/race-identity";
+import {
+  assertNoDuplicateRaces,
+  backfillRaceClientKey,
+  raceClientKey,
+  raceNaturalKey,
+} from "@/lib/race-identity";
 import { ruleIdentityKey } from "@/lib/rule-identity";
 import { canonicalJson, type LocalBackup } from "@/lib/sync/backup-format";
 import { migrationSemanticProjection } from "@/lib/sync/migration-plan";
@@ -207,8 +212,10 @@ function makeBlankRace(
 ): RaceRecord {
   const now = new Date().toISOString();
   const schedule = newRaceScheduleInJapan();
+  const id = makeId("race");
   return {
-    id: makeId("race"),
+    id,
+    clientKey: id,
     dataScope: settings.defaultDataScope,
     date: schedule.date,
     course: "東京",
@@ -513,7 +520,10 @@ export function UmaNoteApp() {
 
         if (!cancelled && isRaceRecordArray(storedRaces)) {
           const hydratedRaces = upgradeLegacyPredictionLocks(
-            normalizeKnownDemoRaceScopes(storedRaces, DEMO_RACE_IDS),
+            normalizeKnownDemoRaceScopes(
+              storedRaces.map((race) => backfillRaceClientKey(race)),
+              DEMO_RACE_IDS,
+            ),
           );
           setRaces(hydratedRaces);
           setActiveRaceId(
@@ -682,9 +692,13 @@ export function UmaNoteApp() {
           version,
           value: cloudRace,
         });
-        const local = nextRaces.find(
+        const localIndex = nextRaces.findIndex(
           (race) => raceNaturalKey(race) === raceNaturalKey(cloudRace),
         );
+        const local = localIndex < 0 ? undefined : nextRaces[localIndex];
+        if (local && local.clientKey !== clientKey) {
+          nextRaces[localIndex] = { ...local, clientKey };
+        }
         if (local && local.id !== clientKey) {
           cloudRaceAliasesRef.current.set(local.id, clientKey);
         }
@@ -1055,14 +1069,13 @@ export function UmaNoteApp() {
 
   const queueRaceCloudSave = useCallback((race: RaceRecord) => {
     const ownerScope = ownerScopeRef.current;
-    const entityKey = cloudRaceAliasesRef.current.get(race.id) ?? race.id;
-    const payload = entityKey === race.id ? race : { ...race, id: entityKey };
+    const entityKey = raceClientKey(race);
     const key = syncEntityKey("race", entityKey);
     enqueueDurableMutation(createOutboxMutation({
       ownerScope,
       entityType: "race",
       entityKey,
-      payload,
+      payload: race,
       baseSnapshot: cloudBaseSnapshotsRef.current.get(key) ?? null,
       expectedVersion: cloudVersionsRef.current.get(key) ?? 0,
     }));
@@ -1288,7 +1301,9 @@ export function UmaNoteApp() {
       }
       const local = nextRaces[localIndex]!;
       if (local.id !== entityKey) nextCloudRaceAliases.set(local.id, entityKey);
-      const localForSync = local.id === entityKey ? local : { ...local, id: entityKey };
+      const localForSync =
+        local.clientKey === entityKey ? local : { ...local, clientKey: entityKey };
+      nextRaces[localIndex] = localForSync;
       const previousBase = previousBases.get(key);
       const localMatchesRemote = sameJson(
         migrationSemanticProjection(localForSync),
@@ -1305,7 +1320,11 @@ export function UmaNoteApp() {
         continue;
       }
       if (localMatchesBase && !pendingMutation) {
-        nextRaces[localIndex] = remote.value;
+        nextRaces[localIndex] = {
+          ...remote.value,
+          id: local.id,
+          clientKey: entityKey,
+        };
         nextCloudVersions.set(key, remote.version);
         nextCloudBases.set(key, remote.value);
         continue;
@@ -1627,7 +1646,7 @@ export function UmaNoteApp() {
       const remote = preview.races.find(
         (candidate) => raceNaturalKey(candidate.value) === raceNaturalKey(race),
       );
-      const clientKey = remote?.clientKey ?? race.id;
+      const clientKey = remote?.clientKey ?? raceClientKey(race);
       if (remote) cloudRaceAliasesRef.current.set(race.id, clientKey);
       return {
         race,
@@ -1815,10 +1834,12 @@ export function UmaNoteApp() {
       } else if (isRaceRecordArray([remote])) {
         const remoteRace = remote as RaceRecord;
         const found = nextRaces.some((race) => race.id === localId);
+        const adoptedRace = found
+          ? { ...remoteRace, id: localId, clientKey: conflict.entityKey }
+          : { ...remoteRace, clientKey: conflict.entityKey };
         nextRaces = found
-          ? nextRaces.map((race) => race.id === localId ? remoteRace : race)
-          : [remoteRace, ...nextRaces];
-        if (nextActiveRaceId === localId) nextActiveRaceId = remoteRace.id;
+          ? nextRaces.map((race) => race.id === localId ? adoptedRace : race)
+          : [adoptedRace, ...nextRaces];
         cloudRaceAliasesRef.current.delete(localId);
       } else {
         throw new Error("クラウド側のレースデータを検証できませんでした。");
@@ -1988,7 +2009,10 @@ export function UmaNoteApp() {
 
   function importRaces(imported: RaceRecord[]) {
     const normalized = upgradeLegacyPredictionLocks(
-      normalizeKnownDemoRaceScopes(imported, DEMO_RACE_IDS),
+      normalizeKnownDemoRaceScopes(
+        imported.map((race) => backfillRaceClientKey(race)),
+        DEMO_RACE_IDS,
+      ),
     );
     const importedIds = new Set(normalized.map((race) => race.id));
     const combined = [

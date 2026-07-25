@@ -5,6 +5,11 @@ export interface RaceIdentityInput {
   raceNumber: number | string;
 }
 
+export interface RaceClientKeyInput {
+  id: string;
+  clientKey?: unknown;
+}
+
 export interface NormalizedRaceIdentity {
   date: string;
   course: string;
@@ -28,6 +33,55 @@ export class RaceIdentityError extends Error {
     this.name = "RaceIdentityError";
     this.duplicates = duplicates;
   }
+}
+
+function nonEmptyIdentity(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+function validClientKey(value: unknown): string | null {
+  const normalized = nonEmptyIdentity(value);
+  if (normalized && normalized.length > 160) {
+    throw new RaceIdentityError("race clientKey must be at most 160 characters");
+  }
+  return normalized;
+}
+
+/**
+ * Returns the immutable cloud client key while accepting pre-clientKey local
+ * records. Older releases used `id` as the server client_key, so that value is
+ * the only safe fallback; generating a replacement would create a duplicate.
+ */
+export function raceClientKey(race: RaceClientKeyInput): string {
+  const persisted = validClientKey(race.clientKey);
+  if (persisted) return persisted;
+  const legacyId = validClientKey(race.id);
+  if (legacyId) return legacyId;
+  throw new RaceIdentityError("race clientKey and legacy id must not be empty");
+}
+
+/**
+ * Completes one legacy record without changing records that already carry an
+ * explicit key. An Outbox entity key is authoritative because it is the durable
+ * identity of a write that may already have been attempted.
+ */
+export function backfillRaceClientKey<T extends RaceClientKeyInput>(
+  race: T,
+  outboxEntityKey?: string | null,
+): T & { clientKey: string } {
+  const persisted = validClientKey(race.clientKey);
+  if (persisted) {
+    return (
+      persisted === race.clientKey
+        ? race
+        : { ...race, clientKey: persisted }
+    ) as T & { clientKey: string };
+  }
+  const queued = validClientKey(outboxEntityKey);
+  return {
+    ...race,
+    clientKey: queued ?? raceClientKey(race),
+  };
 }
 
 function normalizeText(value: string, field: string): string {
@@ -122,16 +176,38 @@ export function assertNoDuplicateRaces(
   races: readonly RaceIdentityInput[],
 ): void {
   const duplicates = findDuplicateRaces(races);
-  if (duplicates.length === 0) return;
+  const clientKeyGroups = new Map<string, string[]>();
+  for (const race of races) {
+    const candidate = race as RaceIdentityInput & { clientKey?: unknown };
+    const key = nonEmptyIdentity(candidate.clientKey) ??
+      nonEmptyIdentity(candidate.id);
+    if (!key) continue;
+    const ids = clientKeyGroups.get(key) ?? [];
+    ids.push(candidate.id ?? "(no id)");
+    clientKeyGroups.set(key, ids);
+  }
+  const duplicateClientKeys = [...clientKeyGroups.entries()]
+    .filter(([, ids]) => ids.length > 1);
+  if (duplicates.length === 0 && duplicateClientKeys.length === 0) return;
 
-  const details = duplicates
+  const naturalDetails = duplicates
     .map((duplicate) => {
       const ids = duplicate.ids.length > 0 ? duplicate.ids.join(", ") : "(no id)";
       return `${duplicate.naturalKey}: ${ids}`;
     })
     .join("; ");
+  const clientKeyDetails = duplicateClientKeys
+    .map(([clientKey, ids]) => `${clientKey}: ${ids.join(", ")}`)
+    .join("; ");
+  const details = [
+    naturalDetails ? `natural keys: ${naturalDetails}` : "",
+    clientKeyDetails ? `client keys: ${clientKeyDetails}` : "",
+  ].filter(Boolean).join("; ");
+  const prefix = duplicates.length > 0
+    ? "Duplicate race natural keys are not allowed"
+    : "Duplicate race client keys are not allowed";
   throw new RaceIdentityError(
-    `Duplicate race natural keys are not allowed: ${details}`,
+    `${prefix}: ${details}`,
     duplicates,
   );
 }

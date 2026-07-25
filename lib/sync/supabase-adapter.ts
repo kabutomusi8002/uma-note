@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { PredictionRuleVersion, RaceRecord, UserSettings } from "../types";
+import { raceClientKey } from "../race-identity";
 import { syncRaceRecord } from "../supabase/race-repository";
 import { syncRuleVersion } from "../supabase/rule-repository";
 import { syncUserSettings } from "../supabase/sync-repository";
@@ -62,6 +63,12 @@ export async function pushOutboxMutation(
   if (mutation.entityType === "race") {
     if (!isRaceRecord(mutation.payload)) {
       return { status: "rejected", message: "レース同期データが不正です。" };
+    }
+    if (raceClientKey(mutation.payload) !== mutation.entityKey) {
+      return {
+        status: "rejected",
+        message: "Race Outbox entityKey does not match the persisted clientKey.",
+      };
     }
     const result = await syncRaceRecord(client, mutation.payload, {
       expectedVersion,

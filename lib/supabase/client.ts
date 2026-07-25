@@ -1,6 +1,8 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-let browserClient: SupabaseClient | null = null;
+type SupabaseClientGlobal = typeof globalThis & {
+  __umaNoteSupabaseClient?: SupabaseClient;
+};
 
 function publicKey(): string | undefined {
   return (
@@ -17,7 +19,10 @@ export function isSupabaseConfigured(): boolean {
 }
 
 export function getSupabaseClient(): SupabaseClient {
-  if (browserClient) return browserClient;
+  const runtime = globalThis as SupabaseClientGlobal;
+  if (runtime.__umaNoteSupabaseClient) {
+    return runtime.__umaNoteSupabaseClient;
+  }
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = publicKey();
@@ -27,13 +32,15 @@ export function getSupabaseClient(): SupabaseClient {
     );
   }
 
-  browserClient = createClient(url, key, {
+  runtime.__umaNoteSupabaseClient = createClient(url, key, {
     auth: {
       persistSession: true,
       autoRefreshToken: true,
-      detectSessionInUrl: true,
+      // PKCE is completed explicitly by /auth/callback. Automatic detection
+      // would race with exchangeCodeForSession and can consume the code twice.
+      detectSessionInUrl: false,
       flowType: "pkce",
     },
   });
-  return browserClient;
+  return runtime.__umaNoteSupabaseClient;
 }

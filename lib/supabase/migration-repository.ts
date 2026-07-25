@@ -87,7 +87,7 @@ export async function applyTrustedLocalMigration(
       client_key: clientKey,
       expected_version: expectedVersion,
       payload: {
-        ...raceToDatabasePayload({ ...race, id: clientKey }),
+        ...raceToDatabasePayload({ ...race, clientKey }),
         client_key: clientKey,
         change_source: "local_migration",
       },

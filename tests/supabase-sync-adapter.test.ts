@@ -55,6 +55,68 @@ describe("Supabase Outbox adapter", () => {
     expect(JSON.stringify(rpc.mock.calls)).not.toMatch(/service_role|secret|password/i);
   });
 
+  it("sends the persisted clientKey when the local UI id is different", async () => {
+    const race = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "local-ui-race-id",
+      clientKey: "stable-outbox-client-key",
+    };
+    const record = {
+      ...raceToDatabasePayload(race),
+      id: "33333333-3333-4333-8333-333333333333",
+      sync_version: 1,
+    };
+    const { client, rpc } = clientWithResponse({
+      status: "applied",
+      record,
+      version: 1,
+      change_seq: 1,
+    });
+    const mutation = createOutboxMutation(
+      {
+        ownerScope: "user:44444444-4444-4444-8444-444444444444",
+        entityType: "race",
+        entityKey: race.clientKey,
+        payload: race,
+        expectedVersion: 0,
+      },
+      { randomUUID: () => MUTATION_ID },
+    );
+
+    await pushOutboxMutation(client, mutation, INSTALLATION_ID);
+
+    expect(rpc).toHaveBeenCalledWith("sync_race_record", expect.objectContaining({
+      p_payload: expect.objectContaining({
+        client_key: "stable-outbox-client-key",
+      }),
+    }));
+    const rpcPayload = rpc.mock.calls[0]?.[1]?.p_payload as Record<string, unknown>;
+    expect(rpcPayload).not.toHaveProperty("id");
+  });
+
+  it("rejects an Outbox/clientKey mismatch before calling Supabase", async () => {
+    const race = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      clientKey: "persisted-client-key",
+    };
+    const { client, rpc } = clientWithResponse(null);
+    const mutation = createOutboxMutation(
+      {
+        ownerScope: "user:44444444-4444-4444-8444-444444444444",
+        entityType: "race",
+        entityKey: "different-entity-key",
+        payload: race,
+        expectedVersion: 0,
+      },
+      { randomUUID: () => MUTATION_ID },
+    );
+
+    await expect(
+      pushOutboxMutation(client, mutation, INSTALLATION_ID),
+    ).resolves.toMatchObject({ status: "rejected" });
+    expect(rpc).not.toHaveBeenCalled();
+  });
+
   it("passes the coordinator abort signal to the Supabase RPC", async () => {
     const race = structuredClone(DEMO_UPCOMING_RACE);
     const record = {

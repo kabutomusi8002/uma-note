@@ -25,6 +25,7 @@ describe("RACE/1 round trip", () => {
     const exported = exportRace(DEMO_RACE);
 
     expect(exported).toMatch(/^---RACE---\nFORMAT_VERSION: 1/);
+    expect(exported).toContain(`CLIENT_KEY: "${DEMO_RACE.clientKey}"`);
     expect(exported).toContain('DATA_SCOPE: "demo"');
     expect(exported.endsWith(RACE_BLOCK_END)).toBe(true);
     expect(parseRace(exported)).toEqual(DEMO_RACE);
@@ -53,6 +54,7 @@ describe("RACE/1 round trip", () => {
       (dataScope, index) => ({
         ...createDemoRace(),
         id: `race-scope-${index + 1}`,
+        clientKey: `race-scope-${index + 1}`,
         dataScope,
       }),
     );
@@ -123,6 +125,22 @@ describe("RACE/1 round trip", () => {
     expect(exported).not.toMatch(/^ENTRIES:/m);
     expect(exported).not.toContain("postTimeLockedAt");
     expect(parseRace(exported)).toEqual(legacyRace);
+  });
+
+  it("CLIENT_KEYのない旧RACE/1文書はIDを安定キーとして補完する", () => {
+    const race = {
+      ...createDemoRace(),
+      id: "legacy-race-id",
+      clientKey: "separate-cloud-key",
+    };
+    const legacyDocument = exportRace(race).replace(
+      /^CLIENT_KEY:.*\n/m,
+      "",
+    );
+    expect(parseRace(legacyDocument)).toMatchObject({
+      id: "legacy-race-id",
+      clientKey: "legacy-race-id",
+    });
   });
 
   it("改行・引用符・日本語をJSON文字列として安全に往復する", () => {
@@ -202,6 +220,23 @@ describe("RACE/1 invalid input", () => {
     );
     expect(() => parseRaces(`${block}\n\n${block}`)).toThrow(
       /レースID .* が重複/,
+    );
+  });
+
+  it("別レースIDでも同じCLIENT_KEYの二重同期候補を拒否する", () => {
+    const first = createDemoRace();
+    const second = {
+      ...createDemoRace(),
+      id: "different-local-id",
+      clientKey: first.clientKey,
+      raceNumber: 10,
+    };
+    expect(() => exportRaces([first, second])).toThrow(/CLIENT_KEY .* が重複/);
+
+    const firstBlock = exportRace(first);
+    const secondBlock = exportRace(second);
+    expect(() => parseRaces(`${firstBlock}\n\n${secondBlock}`)).toThrow(
+      /CLIENT_KEY .* が重複/,
     );
   });
 

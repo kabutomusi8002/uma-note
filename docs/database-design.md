@@ -110,13 +110,14 @@ DBビューが次を提供する。
 
 - `get_race_records()`：自分のレースを発走時刻降順のJSON配列で取得
 - `get_race_record(p_race_id)`：1レースを入れ子JSONで取得
-- `upsert_race_record(payload)`：1レース分を1トランザクションで保存
+- `sync_race_record(payload, expected_version, mutation_id, installation_id)`：安定した`client_key`とCASを使って1レース分を冪等保存
 - `lock_prediction(p_prediction_id)`：予想をロック
 
-最小の`upsert_race_record`入力例：
+`upsert_race_record(payload)`は`sync_race_record`からだけ呼ばれる内部集約writerであり、`public`、`anon`、`authenticated`からの直接実行権限は剥奪する。最小のレースpayload例：
 
 ```json
 {
+  "client_key": "race-client-generated-once",
   "meeting": {
     "meeting_date": "2026-07-18",
     "meeting_number": 1,
@@ -151,7 +152,7 @@ DBビューが次を提供する。
 }
 ```
 
-既存レースの更新時は最上位の`id`へレースUUIDを指定する。買い目は`first_horse_number`、`second_horse_number`、`third_horse_number`の代わりに`selections: [1, 2, 3]`も使用できる。`upsert_race_record`はRLS対象であり、他ユーザーのUUIDを渡すと「存在しない/アクセス不可」として失敗する。
+`client_key`はレース作成時に端末で一度だけ生成し、Outboxの再送・再起動・オフライン復帰でも変更しない。新規INSERTでは`user_id`と`client_key`を同時に書き込み、後段UPDATEでキーを付け替えない。既存レースは`client_key`と`expected_version`で解決し、サーバーのレースUUIDをクライアント同期IDとして使用しない。買い目は`first_horse_number`、`second_horse_number`、`third_horse_number`の代わりに`selections: [1, 2, 3]`も使用できる。
 
 ## `---RACE---`形式
 
@@ -161,6 +162,7 @@ DBビューが次を提供する。
 ---RACE---
 FORMAT_VERSION: 1
 ID: "race-id"
+CLIENT_KEY: "race-client-generated-once"
 DATE: "2026-07-18"
 COURSE: "東京"
 RACE_NUMBER: 11
@@ -178,7 +180,7 @@ UPDATED_AT: "2026-07-17T12:00:00.000Z"
 ---END RACE---
 ```
 
-UIで`lib/race-format.ts`により形式・必須キー・値を検証し、RaceRecordからDB用JSONへ変換した後に`upsert_race_record`を呼ぶ。エクスポートもUIでDB用JSONをRaceRecordへ戻してからRACE/1へ変換する。DB独自の交換形式は持たない。`race_exchange_documents`は、必要に応じて元文書、方向、処理状態を監査保存するためのテーブルである。
+UIで`lib/race-format.ts`により形式・必須キー・値を検証し、RaceRecordからDB用JSONへ変換した後にversion付き`sync_race_record`を呼ぶ。`CLIENT_KEY`は後方互換の任意項目で、旧RACE/1文書では`ID`を安定キーとして補完する。エクスポートもUIでDB用JSONをRaceRecordへ戻してからRACE/1へ変換する。DB独自の交換形式は持たない。`race_exchange_documents`は、必要に応じて元文書、方向、処理状態を監査保存するためのテーブルである。
 
 ## 適用
 
@@ -195,7 +197,7 @@ supabase link --project-ref <project-ref>
 supabase db push
 ```
 
-マイグレーションは`supabase/migrations/0001_initial_schema.sql`、共有マスターは`supabase/seed.sql`にある。
+マイグレーションは`supabase/migrations/0001_initial_schema.sql`から`supabase/migrations/0007_race_client_key_insert_fix.sql`までを番号順に適用し、共有マスターは`supabase/seed.sql`から投入する。
 
 ## クラウド同期プロトコル
 
@@ -204,6 +206,8 @@ supabase db push
 全テーブルでRLSを有効化する。ユーザーテーブルの基本条件は`user_id = (select auth.uid())`、共有マスターは`authenticated`の読み取りだけである。集約配下の直接INSERT／UPDATE／DELETEは取り消し、公開RPCからだけ更新する。権限昇格する内部helperは一般ロールから実行権限を剥奪し、公開RPCでは`auth.uid()`、固定`search_path`、入力hashを検証する。
 
 レース、ルール、設定には単調増加する`sync_version`を持たせる。更新RPCは`expected_version`と`mutation_id`を必須とし、version不一致時は何も更新せず現在のクラウド値を返す。同じmutation IDと同じpayload hashの再送は保存済みresponseを返し、異なるpayloadでのmutation ID再利用は拒否する。
+
+`0007_race_client_key_insert_fix.sql`は、`races.client_key`を初回INSERTの列リストへ直接含める。`client_key`のNULL・空白・160文字超を拒否し、`(user_id, client_key)`の一意制約とキー変更拒否triggerを維持する。同じmutationの再送はreceiptから再生し、別mutationで同じキーをcreateしようとした場合はversion conflict、同じ自然キーを別キーで作成しようとした場合はnatural-key conflictとして返す。
 
 `sync_change_log`はユーザー別の差分cursorを提供し、Realtime通知は差分取得のきっかけにだけ使用する。削除を実装する場合はroot集約のtombstoneをchange logへ記録し、端末側の古いキャッシュを復活させない。
 

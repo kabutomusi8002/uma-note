@@ -3148,3 +3148,50 @@ textarea:disabled {
     grid-template-columns: 1fr;
   }
 }
+
+.auth-callback-shell {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at top left, rgb(223 238 226 / 90%), transparent 42%),
+    #f6f2e8;
+}
+
+.auth-callback-card {
+  width: min(100%, 480px);
+  display: grid;
+  gap: 14px;
+  padding: 32px;
+  border: 1px solid rgb(21 63 53 / 14%);
+  border-radius: 24px;
+  background: rgb(255 255 255 / 92%);
+  box-shadow: 0 24px 60px rgb(21 63 53 / 14%);
+}
+
+.auth-callback-card .brand-mark {
+  margin-bottom: 6px;
+}
+
+.auth-callback-card h1,
+.auth-callback-card p {
+  margin: 0;
+}
+
+.auth-callback-action {
+  justify-self: start;
+  margin-top: 8px;
+  text-decoration: none;
+}
+
+@media (max-width: 520px) {
+  .auth-callback-shell {
+    padding: 16px;
+  }
+
+  .auth-callback-card {
+    padding: 24px 20px;
+    border-radius: 20px;
+  }
+}

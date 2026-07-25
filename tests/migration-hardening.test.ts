@@ -9,6 +9,11 @@ const expectedMigrationFiles = [
   "0004_cloud_sync_protocol.sql",
   "0005_locked_snapshot_and_local_migration.sql",
   "0006_pre_remote_hardening.sql",
+  "0007_race_client_key_insert_fix.sql",
+] as const;
+const expectedIntegrationTestFiles = [
+  "0006_pre_remote_hardening_test.sql",
+  "0007_race_client_key_insert_fix_test.sql",
 ] as const;
 
 const migrationFiles = readdirSync(migrationDirectory)
@@ -21,13 +26,20 @@ const migrations = new Map(
   ]),
 );
 const hardening = migrations.get("0006_pre_remote_hardening.sql") ?? "";
-const futureIntegrationTest = readFileSync(
-  new URL(
-    "../supabase/tests/0006_pre_remote_hardening_test.sql",
-    import.meta.url,
-  ),
-  "utf8",
+const raceClientKeyFix =
+  migrations.get("0007_race_client_key_insert_fix.sql") ?? "";
+const integrationTestDirectory = new URL(
+  "../supabase/tests/",
+  import.meta.url,
 );
+const integrationTests = new Map(
+  expectedIntegrationTestFiles.map((name) => [
+    name,
+    readFileSync(new URL(name, integrationTestDirectory), "utf8"),
+  ]),
+);
+const raceClientKeyIntegrationTest =
+  integrationTests.get("0007_race_client_key_insert_fix_test.sql") ?? "";
 
 function between(source: string, start: string, end: string): string {
   const startIndex = source.indexOf(start);
@@ -148,7 +160,7 @@ function postgresLexicalErrors(source: string): string[] {
 }
 
 describe("pre-remote migration chain", () => {
-  it("contains exactly the reviewed 0001 through 0006 sequence", () => {
+  it("contains exactly the reviewed 0001 through 0007 sequence", () => {
     expect(migrationFiles).toEqual(expectedMigrationFiles);
   });
 
@@ -175,11 +187,15 @@ describe("pre-remote migration chain", () => {
     }
   });
 
-  it("keeps the future local-DB integration test transactional and complete", () => {
-    expect(futureIntegrationTest).toMatch(/^\s*--[\s\S]*\nbegin;\s/im);
-    expect(futureIntegrationTest).toMatch(/\brollback;\s*$/i);
-    expect(postgresLexicalErrors(futureIntegrationTest)).toEqual([]);
-  });
+  it.each(expectedIntegrationTestFiles)(
+    "%s stays transactional and lexically complete",
+    (name) => {
+      const integrationTest = integrationTests.get(name) ?? "";
+      expect(integrationTest).toMatch(/^\s*--[\s\S]*\nbegin;\s/im);
+      expect(integrationTest).toMatch(/\brollback;\s*$/i);
+      expect(postgresLexicalErrors(integrationTest)).toEqual([]);
+    },
+  );
 });
 
 describe("0006 immutable lock scope hardening", () => {
@@ -409,4 +425,152 @@ describe("0006 modification timestamps", () => {
       );
     });
   }
+});
+
+describe("0007 immutable race client identity", () => {
+  const aggregateUpsert = between(
+    raceClientKeyFix,
+    "create or replace function public.upsert_race_record(",
+    "-- Enforce client identity immutability",
+  );
+  const raceIdentityWrite = between(
+    aggregateUpsert,
+    "if v_race_id is null then",
+    "-- Serialize the nested save",
+  );
+  const identityTrigger = between(
+    raceClientKeyFix,
+    "create or replace function public.reject_race_client_key_change()",
+    "create or replace function public.sync_race_record_0004_internal(",
+  );
+  const syncWriter = between(
+    raceClientKeyFix,
+    "create or replace function public.sync_race_record_0004_internal(",
+    "revoke all on function public.upsert_race_record(jsonb)",
+  );
+
+  it("requires one trimmed explicit client key for both race write paths", () => {
+    for (const writer of [aggregateUpsert, syncWriter]) {
+      expect(writer).toMatch(
+        /v_client_key := nullif\(btrim\(.+ ->> 'client_key'\), ''\);/,
+      );
+      expect(writer).toContain(
+        "v_client_key is null or char_length(v_client_key) > 160",
+      );
+      expect(writer).toContain("errcode = '22023'");
+      expect(writer).toContain(
+        "message = 'A valid explicit client_key is required'",
+      );
+    }
+  });
+
+  it("inserts the owner and immutable client key atomically", () => {
+    expect(raceIdentityWrite).toMatch(
+      /insert into public\.races\s*\(\s*user_id,\s*meeting_id,\s*client_key,/,
+    );
+    expect(raceIdentityWrite).toMatch(
+      /\)\s*values\s*\(\s*v_user_id,\s*v_meeting_id,\s*v_client_key,/,
+    );
+    expect(raceIdentityWrite).toContain(
+      "where races.user_id = v_user_id\n      and races.client_key = v_client_key",
+    );
+    expect(raceIdentityWrite).toContain(
+      "Race natural identity already belongs to a different client_key",
+    );
+    expect(raceIdentityWrite).not.toContain("client_key = excluded.client_key");
+    expect(raceIdentityWrite).not.toMatch(/\bset\s+client_key\s*=/i);
+  });
+
+  it("rejects re-keying at the table boundary", () => {
+    expect(aggregateUpsert).toContain(
+      "v_existing_client_key is distinct from v_client_key",
+    );
+    expect(aggregateUpsert).toContain(
+      "message = 'Existing race client_key is immutable'",
+    );
+    expect(identityTrigger).toContain(
+      "if new.client_key is distinct from old.client_key then",
+    );
+    expect(identityTrigger).toContain(
+      "create trigger races_reject_client_key_change",
+    );
+    expect(identityTrigger).toContain(
+      "before update of client_key on public.races",
+    );
+  });
+
+  it("checks a committed receipt before enforcing the new key contract", () => {
+    const receiptLookup = syncWriter.indexOf(
+      "select * into v_receipt",
+    );
+    const keyValidation = syncWriter.indexOf(
+      "v_client_key := nullif(btrim(p_payload ->> 'client_key'), '')",
+    );
+    expect(receiptLookup).toBeGreaterThanOrEqual(0);
+    expect(keyValidation).toBeGreaterThan(receiptLookup);
+    expect(syncWriter.slice(receiptLookup, keyValidation)).toContain(
+      "v_receipt.request_sha256 <> v_request_hash",
+    );
+    expect(syncWriter.slice(receiptLookup, keyValidation)).toContain(
+      "mutation_id was already used with a different request",
+    );
+    expect(syncWriter.slice(receiptLookup, keyValidation)).toContain(
+      "return v_receipt.response || jsonb_build_object('status', 'replayed')",
+    );
+  });
+
+  it("returns non-writing identity/version conflicts and never re-keys later", () => {
+    expect(syncWriter).toContain("'reason', 'natural_key_exists'");
+    expect(syncWriter).toContain("'reason', 'identity_collision'");
+    expect(syncWriter).toContain("'reason', 'client_key_mismatch'");
+    expect(syncWriter).toContain("'reason', 'version_mismatch'");
+    expect(syncWriter).toContain(
+      "where id = v_race_id\n    and user_id = v_user_id\n    and client_key = v_client_key",
+    );
+
+    const finalRaceUpdate = between(
+      syncWriter,
+      "update public.races\n  set client_record = v_client_record",
+      "insert into public.sync_change_log (",
+    );
+    const finalRaceSetClause = between(
+      finalRaceUpdate,
+      "update public.races\n  set",
+      "where id = v_race_id",
+    );
+    expect(finalRaceSetClause).not.toMatch(/\bclient_key\s*=/i);
+  });
+
+  it("keeps aggregate writers private after replacing their definitions", () => {
+    expect(raceClientKeyFix).toContain(
+      "revoke all on function public.upsert_race_record(jsonb)",
+    );
+    expect(raceClientKeyFix).toContain(
+      "revoke all on function public.sync_race_record_0004_internal(",
+    );
+    expect(raceClientKeyFix).toContain(
+      "revoke all on function public.reject_race_client_key_change()",
+    );
+    expect(raceClientKeyFix).toContain("from public, anon, authenticated");
+  });
+
+  it("ships a fresh-DB integration scenario for every identity invariant", () => {
+    expect(raceClientKeyIntegrationTest).toContain(
+      "fresh local database has applied migrations 0001-0007",
+    );
+    for (const contract of [
+      "repeat('x', 161)",
+      "Mutation id reuse with changed content unexpectedly passed",
+      "when sqlstate '22023'",
+      "'version_mismatch'",
+      "'natural_key_exists'",
+      "'client_key_mismatch'",
+      "races_reject_client_key_change",
+      "prediction_locked_snapshots",
+      "v_original_snapshot_hash",
+      "v_race_financial_summary",
+    ]) {
+      expect(raceClientKeyIntegrationTest).toContain(contract);
+    }
+  });
 });

@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { expandBetCombinations } from "@/lib/calculations";
+import { raceClientKey } from "@/lib/race-identity";
 import { repositoryError } from "@/lib/supabase/repository-error";
 import { RACE_DATA_SCOPES } from "@/lib/types";
 import type {
@@ -371,8 +372,7 @@ export function raceToDatabasePayload(race: RaceRecord): JsonObject {
   );
 
   return {
-    ...(UUID_PATTERN.test(race.id) ? { id: race.id } : {}),
-    client_key: race.id,
+    client_key: raceClientKey(race),
     change_source: "uma_note_pwa",
     meeting: {
       meeting_date: race.date,
@@ -537,6 +537,7 @@ export function databaseRecordToRace(raw: unknown): RaceRecord {
 
   return {
     id: clientRaceId,
+    clientKey: clientRaceId,
     dataScope,
     ...(raceStatus ? { status: raceStatus } : {}),
     date,
@@ -671,13 +672,17 @@ function syncEnvelope(raw: unknown, fallbackClientKey = ""): RaceSyncEnvelope {
   const record = object(response.record ?? raw);
   const race = databaseRecordToRace(record);
   const raceRow = object(record.race);
+  const clientKey = text(
+    response.client_key,
+    text(record.client_key, fallbackClientKey || race.clientKey),
+  );
   return {
     race: {
       ...race,
-      id: text(response.client_key, text(record.client_key, fallbackClientKey || race.id)),
+      clientKey,
     },
     cloudId: text(response.entity_id, text(record.id)),
-    clientKey: text(response.client_key, text(record.client_key, fallbackClientKey || race.id)),
+    clientKey,
     version: numberValue(
       response.version,
       numberValue(record.sync_version, numberValue(raceRow.sync_version, 0)),

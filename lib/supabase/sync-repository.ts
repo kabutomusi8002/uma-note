@@ -76,7 +76,7 @@ export async function loadSyncBootstrap(
     const value = databaseRecordToRace(row);
     return {
       value,
-      clientKey: text(row.client_key, value.id),
+      clientKey: text(row.client_key, value.clientKey),
       cloudId: text(row.id),
       version: numberValue(row.sync_version),
     };

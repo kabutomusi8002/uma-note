@@ -95,7 +95,7 @@ NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<sb_publishable_...>
 NEXT_PUBLIC_SITE_URL=https://<your-production-domain>
 ```
 
-`NEXT_PUBLIC_SITE_URL`は公開時のOG画像URL用です。ローカルだけなら省略できます。
+`NEXT_PUBLIC_SITE_URL`は公開時のメタデータとPKCE認証コールバックURLの基準です。ローカル開発では`http://127.0.0.1:4173`、本番では公開先のHTTPS originを設定してください。
 
 旧プロジェクトでは `NEXT_PUBLIC_SUPABASE_ANON_KEY` も使用できます。`service_role`、`sb_secret_*`、DBパスワード、接続文字列はブラウザ用ではなく、このアプリのクライアントコードから参照しません。管理作業はSupabase CLIまたはDashboardの保護された設定で行ってください。
 
@@ -124,7 +124,8 @@ SQL Editorを使う場合は、次の順に実行します。
 4. `supabase/migrations/0004_cloud_sync_protocol.sql`
 5. `supabase/migrations/0005_locked_snapshot_and_local_migration.sql`
 6. `supabase/migrations/0006_pre_remote_hardening.sql`
-7. `supabase/seed.sql`
+7. `supabase/migrations/0007_race_client_key_insert_fix.sql`
+8. `supabase/seed.sql`
 
 マイグレーションには、テーブル、制約、インデックス、変更履歴トリガー、発走時刻ロック、集計ビュー、JSON保存RPC、RLSポリシーが含まれます。
 
@@ -132,12 +133,15 @@ SQL Editorを使う場合は、次の順に実行します。
 
 Supabase AuthenticationのURL Configurationで、以下を登録します。
 
-- Site URL：公開先URL。開発時だけなら表示されたLocal URL
-- Redirect URLs：Local URLと本番URLを両方追加
+- Site URL：公開先URL。ローカル開発では`http://127.0.0.1:4173`
+- Redirect URLs：`http://127.0.0.1:4173/auth/callback`
+- 本番のRedirect URL：`https://<your-production-domain>/auth/callback`
 
-アプリの「設定」→「クラウド同期」でメールアドレスを入力します。認証はPKCEのメールリンク方式です。リンクは認証を開始した同じ端末・ブラウザで開いてください。初回は端末データを即時送信せず、完全バックアップとクラウド差分のプレビュー後に移行対象を確定します。
+アプリの「設定」→「クラウド同期」でメールアドレスを入力します。認証はPKCEのメールリンク方式です。リンクは認証を開始した同じ端末・ブラウザで開いてください。`/auth/callback`がURLの一時コードをセッションへ交換し、コードをURLから除去してホームへ戻します。期限切れまたは使用済みのリンクは再送してください。Redirect URL変更前に送信した古いリンクは再利用せず、新しいリンクを送信します。初回は端末データを即時送信せず、完全バックアップとクラウド差分のプレビュー後に移行対象を確定します。
 
 通常編集は端末へ即時保存され、認証済みかつオンラインのときだけOutboxが送信されます。オフライン、通信失敗、トークン更新中でも変更は残り、再接続・画面復帰・手動再試行で同期を再開します。同期中にログアウトまたは別ユーザーへ切り替わった場合は進行中の要求を中断し、元ユーザーのOutboxをそのユーザー領域へ残します。別端末の更新はRLS付き`sync_change_log`のRealtime通知をきっかけに再取得しますが、通知自体を正本にはせず、version付きRPCの結果だけを採用します。migrationは、Supabase管理publicationが存在する場合だけこのchange logを自動追加します。
+
+レースの`client_key`は作成時に一度だけ生成し、端末内レース、RACE/1バックアップ、Outbox payloadと`entityKey`へ保存します。リトライやアプリ再起動では同じ値を再利用します。旧版の未送信Outboxにキーがない場合は、保存済みOutboxの`entityKey`（なければ旧レースID）を一度だけ補完して端末DBへ再保存し、新しいランダム値は作りません。DB側も初回INSERT時点で`client_key`を必須にし、同じmutationの再送を二重登録せず、同じキーに別内容をcreateしようとした場合は競合として扱います。
 
 初回移行画面は、バックアップ時点のレース・ルール・設定をクラウド値と比較します。レースは`live/demo/test`を保ったまま個別選択し、同名同版で内容の異なる不変ルール、設定の差、ロック済みレースは明示的な選択が終わるまで送信しません。発走後に初めて同期される未ロック予想は編集用の`client_record`として保持し、不変の発走前証跡には昇格しません。オフラインで発走前に明示ロックし、発走後に初めて同期した場合は、クライアント時刻由来であることを示す別の不変証跡へ保存します。`v0.1.1-local-clean`時代のロック済みレースは、当時固定されていた予想・予想買い目・ルールから`legacy_local_upgrade`証跡をバックアップ内に再構成してから、プレビュー付き専用移行を使用します。
 

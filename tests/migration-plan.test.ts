@@ -12,6 +12,7 @@ function liveUpcoming(): RaceRecord {
   return {
     ...createDemoRaces()[0],
     id: "local-upcoming",
+    clientKey: "local-upcoming",
     dataScope: "live",
   };
 }
@@ -19,8 +20,20 @@ function liveUpcoming(): RaceRecord {
 describe("migration preview", () => {
   it("liveだけを既定選択し、demo/testのscopeを保持して除外する", async () => {
     const live = liveUpcoming();
-    const demo = { ...liveUpcoming(), id: "demo", raceNumber: 10, dataScope: "demo" as const };
-    const test = { ...liveUpcoming(), id: "test", raceNumber: 9, dataScope: "test" as const };
+    const demo = {
+      ...liveUpcoming(),
+      id: "demo",
+      clientKey: "demo",
+      raceNumber: 10,
+      dataScope: "demo" as const,
+    };
+    const test = {
+      ...liveUpcoming(),
+      id: "test",
+      clientKey: "test",
+      raceNumber: 9,
+      dataScope: "test" as const,
+    };
 
     const plan = await buildMigrationPlan({
       localRaces: [test, live, demo],

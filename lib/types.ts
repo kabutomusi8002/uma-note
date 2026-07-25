@@ -242,6 +242,13 @@ export const DEFAULT_USER_SETTINGS: Readonly<UserSettings> = {
 export interface RaceRecord {
   id: string;
   /**
+   * Immutable client-generated identity used by the cloud sync protocol.
+   *
+   * This is deliberately separate from the PostgreSQL race UUID and from the
+   * mutable date/course/race-number natural identity.
+   */
+  clientKey: string;
+  /**
    * Controls whether this record contributes to bankroll/performance totals.
    * Older records without this field are treated as `live`.
    */

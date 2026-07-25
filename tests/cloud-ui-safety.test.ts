@@ -37,6 +37,24 @@ describe("cloud UI safety wiring", () => {
     expect(appSource).toContain("rerunRequested = true");
   });
 
+  it("generates one stable race clientKey and queues that persisted value", () => {
+    const blankRace = appSource.slice(
+      appSource.indexOf("function makeBlankRace"),
+      appSource.indexOf("function safeSummary"),
+    );
+    const queueRace = appSource.slice(
+      appSource.indexOf("const queueRaceCloudSave"),
+      appSource.indexOf("const queueRuleCloudAction"),
+    );
+    expect(blankRace).toContain('const id = makeId("race")');
+    expect(blankRace).toContain("id,");
+    expect(blankRace).toContain("clientKey: id");
+    expect(queueRace).toContain("const entityKey = raceClientKey(race)");
+    expect(queueRace).toContain("payload: race");
+    expect(queueRace).not.toContain("cloudRaceAliasesRef.current.get");
+    expect(appSource).toContain("nextRaces[localIndex] = { ...local, clientKey }");
+  });
+
   it("commits a local conflict choice and old-intent removal atomically", () => {
     const handler = appSource.slice(
       appSource.indexOf("const resendLocalConflictVersion"),
