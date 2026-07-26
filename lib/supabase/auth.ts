@@ -4,6 +4,14 @@ import { getSupabaseClient, isSupabaseConfigured } from "@/lib/supabase/client";
 export const CLOUD_AUTH_CALLBACK_PATH = "/auth/callback";
 export const CLOUD_AUTH_CALLBACK_ERROR =
   "ログインリンクを確認できませんでした。期限切れまたは使用済みの可能性があります。設定画面からもう一度ログインしてください。";
+export const EMAIL_OTP_INVALID_ERROR =
+  "認証コードが正しくありません。最新の6桁コードを確認してください。";
+export const EMAIL_OTP_EXPIRED_ERROR =
+  "認証コードの有効期限が切れています。新しいコードを送信してください。";
+export const EMAIL_OTP_RATE_LIMIT_ERROR =
+  "認証の試行回数が上限に達しました。しばらく待ってから再試行してください。";
+export const EMAIL_OTP_SEND_ERROR =
+  "認証コードを送信できませんでした。しばらく待ってから再試行してください。";
 
 export type CloudAuthState =
   | { status: "local"; user: null; session: null }
@@ -106,6 +114,84 @@ export async function sendEmailMagicLink(email: string): Promise<void> {
     },
   });
   if (error) throw error;
+}
+
+type AuthErrorDetails = {
+  code?: string;
+  message?: string;
+  status?: number;
+};
+
+function authErrorDetails(cause: unknown): AuthErrorDetails {
+  if (!cause || typeof cause !== "object") return {};
+  const value = cause as Record<string, unknown>;
+  return {
+    ...(typeof value.code === "string" ? { code: value.code } : {}),
+    ...(typeof value.message === "string" ? { message: value.message } : {}),
+    ...(typeof value.status === "number" ? { status: value.status } : {}),
+  };
+}
+
+function emailOtpError(
+  cause: unknown,
+  phase: "request" | "verify",
+): Error {
+  const details = authErrorDetails(cause);
+  const searchable = `${details.code ?? ""} ${details.message ?? ""}`.toLowerCase();
+  if (
+    details.status === 429 ||
+    searchable.includes("rate limit") ||
+    searchable.includes("rate_limit") ||
+    searchable.includes("too many")
+  ) {
+    return new Error(EMAIL_OTP_RATE_LIMIT_ERROR);
+  }
+  if (phase === "verify" && searchable.includes("expired")) {
+    return new Error(EMAIL_OTP_EXPIRED_ERROR);
+  }
+  return new Error(
+    phase === "verify" ? EMAIL_OTP_INVALID_ERROR : EMAIL_OTP_SEND_ERROR,
+  );
+}
+
+export async function requestEmailOtp(email: string): Promise<void> {
+  const normalizedEmail = email.trim();
+  if (!normalizedEmail) throw new Error("メールアドレスを入力してください。");
+
+  const { error } = await getSupabaseClient().auth.signInWithOtp({
+    email: normalizedEmail,
+    options: {
+      shouldCreateUser: true,
+    },
+  });
+  if (error) throw emailOtpError(error, "request");
+}
+
+export async function verifyEmailOtp(
+  email: string,
+  token: string,
+): Promise<Session> {
+  const normalizedEmail = email.trim();
+  const normalizedToken = token.trim();
+  if (!normalizedEmail) throw new Error("メールアドレスを入力してください。");
+  if (!/^\d{6}$/.test(normalizedToken)) {
+    throw new Error(EMAIL_OTP_INVALID_ERROR);
+  }
+
+  const client = getSupabaseClient();
+  const { data, error } = await client.auth.verifyOtp({
+    email: normalizedEmail,
+    token: normalizedToken,
+    type: "email",
+  });
+  if (error) throw emailOtpError(error, "verify");
+  if (data.session) return data.session;
+
+  const { data: current, error: sessionError } = await client.auth.getSession();
+  if (sessionError || !current.session) {
+    throw emailOtpError(sessionError, "verify");
+  }
+  return current.session;
 }
 
 export async function exchangeCloudAuthCode(code: string): Promise<Session> {

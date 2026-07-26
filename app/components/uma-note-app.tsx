@@ -47,10 +47,11 @@ import {
 } from "@/lib/supabase/client";
 import {
   readCloudAuthState,
-  sendEmailMagicLink,
+  requestEmailOtp,
   signOutFromCloud,
   subscribeToCloudAuth,
   type CloudAuthState,
+  verifyEmailOtp,
 } from "@/lib/supabase/auth";
 import {
   loadSyncBootstrap,
@@ -3569,6 +3570,8 @@ function SettingsView({
   const [exportPreview, setExportPreview] = useState("");
   const [exportError, setExportError] = useState<string | null>(null);
   const [email, setEmail] = useState("");
+  const [otpToken, setOtpToken] = useState("");
+  const [otpRequested, setOtpRequested] = useState(false);
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<"idle" | "working" | "error">("idle");
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
@@ -3586,25 +3589,52 @@ function SettingsView({
     return () => data.subscription.unsubscribe();
   }, [supabaseConfigured]);
 
-  async function sendMagicLink() {
+  async function sendOtp() {
     if (!email.trim()) {
       setConnectionMessage("メールアドレスを入力してください。");
       return;
     }
     setSyncState("working");
     try {
-      await sendEmailMagicLink(email);
-      setConnectionMessage("ログイン用リンクを送信しました。メールからこのアプリへ戻ってください。");
+      await requestEmailOtp(email);
+      setOtpRequested(true);
+      setOtpToken("");
+      setConnectionMessage("6桁の認証コードを送信しました。最新のコードを入力してください。");
       setSyncState("idle");
     } catch (cause) {
-      setConnectionMessage(cause instanceof Error ? cause.message : "ログインリンクを送信できませんでした。");
+      setConnectionMessage(cause instanceof Error ? cause.message : "認証コードを送信できませんでした。");
+      setSyncState("error");
+    }
+  }
+
+  async function verifyOtp() {
+    setSyncState("working");
+    try {
+      const session = await verifyEmailOtp(email, otpToken);
+      setUserEmail(session.user.email ?? email.trim());
+      setOtpToken("");
+      setOtpRequested(false);
+      setConnectionMessage("認証が完了しました。クラウド同期を利用できます。");
+      setSyncState("idle");
+    } catch (cause) {
+      setConnectionMessage(cause instanceof Error ? cause.message : "認証コードを確認できませんでした。");
       setSyncState("error");
     }
   }
 
   async function signOut() {
-    await signOutFromCloud();
-    setConnectionMessage("ログアウトしました。端末上の表示データはそのままです。");
+    setSyncState("working");
+    try {
+      await signOutFromCloud();
+      setUserEmail(null);
+      setOtpToken("");
+      setOtpRequested(false);
+      setConnectionMessage("ログアウトしました。端末上の表示データはそのままです。");
+      setSyncState("idle");
+    } catch {
+      setConnectionMessage("ログアウトできませんでした。通信状態を確認してください。");
+      setSyncState("error");
+    }
   }
 
   async function loadFromCloud() {
@@ -3726,9 +3756,37 @@ function SettingsView({
           {supabaseConfigured && !userEmail && (
             <div className="auth-panel">
               <Field label="同期に使うメールアドレス">
-                <input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" />
+                <input type="email" autoComplete="email" value={email} readOnly={otpRequested} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" />
               </Field>
-              <button className="primary-button full" type="button" disabled={syncState === "working"} onClick={sendMagicLink}>メールでログイン</button>
+              <button className="primary-button full" type="button" disabled={syncState === "working"} onClick={sendOtp}>
+                {otpRequested ? "認証コードを再送" : "認証コードを送信"}
+              </button>
+              {otpRequested && (
+                <>
+                  <Field label="6桁の認証コード">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      pattern="[0-9]{6}"
+                      maxLength={6}
+                      value={otpToken}
+                      onChange={(event) =>
+                        setOtpToken(event.target.value.replace(/\D/g, "").slice(0, 6))
+                      }
+                      placeholder="6桁の数字"
+                    />
+                  </Field>
+                  <button
+                    className="secondary-button full"
+                    type="button"
+                    disabled={syncState === "working" || otpToken.length !== 6}
+                    onClick={verifyOtp}
+                  >
+                    コードを確認
+                  </button>
+                </>
+              )}
             </div>
           )}
           {supabaseConfigured && userEmail && (
