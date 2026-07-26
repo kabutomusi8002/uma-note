@@ -15,6 +15,9 @@ export interface CreateMutationInput<T = unknown> {
   baseSnapshot?: unknown | null;
   expectedVersion?: number | null;
   expectedParentVersion?: number | null;
+  predecessorMutationId?: string;
+  deliveryPolicy?: OutboxMutation["deliveryPolicy"];
+  rebase?: OutboxMutation["rebase"];
 }
 
 export interface MutationFactoryOptions {
@@ -71,7 +74,31 @@ export function createOutboxMutation<T>(
   if (input.expectedParentVersion !== undefined) {
     mutation.expectedParentVersion = input.expectedParentVersion;
   }
+  if (input.predecessorMutationId !== undefined) {
+    mutation.predecessorMutationId = input.predecessorMutationId;
+  }
+  if (input.deliveryPolicy !== undefined) {
+    mutation.deliveryPolicy = input.deliveryPolicy;
+  }
+  if (input.rebase !== undefined) {
+    mutation.rebase = input.rebase;
+  }
   return mutation;
+}
+
+export function isTerminalOutboxStatus(
+  status: OutboxMutation["status"],
+): boolean {
+  return status === "superseded_stale" ||
+    status === "resolved_superseded" ||
+    status === "superseded_invalid_lineage" ||
+    status === "applied_audited";
+}
+
+export function isOutboxMutationActionable(
+  mutation: OutboxMutation,
+): boolean {
+  return !isTerminalOutboxStatus(mutation.status);
 }
 
 export function ownerScopeForUser(userId: string): OwnerScope {
@@ -185,6 +212,7 @@ export function isMutationDue(
   now: Date = new Date(),
   staleInFlightMs = 60_000,
 ): boolean {
+  if (mutation.deliveryPolicy === "manual-review") return false;
   if (mutation.status === "pending") return true;
   if (mutation.status === "retry") {
     return Date.parse(mutation.nextAttemptAt) <= now.getTime();

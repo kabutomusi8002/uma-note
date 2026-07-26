@@ -1,4 +1,5 @@
 import {
+  listConflicts,
   listOutbox,
   putConflict,
   removeOutbox,
@@ -7,6 +8,7 @@ import {
 } from "../storage/local-db";
 import {
   classifySyncError,
+  isOutboxMutationActionable,
   isMutationDue,
   isOwnerAuthorized,
   markMutationForRetry,
@@ -161,7 +163,9 @@ export function createSyncCoordinator(
   }
 
   async function refreshPendingCount(ownerScope: OwnerScope): Promise<number> {
-    return (await listOutbox(options.database, ownerScope)).length;
+    return (await listOutbox(options.database, ownerScope))
+      .filter(isOutboxMutationActionable)
+      .length;
   }
 
   function isCurrentSyncContext(ownerScope: OwnerScope, userId: string): boolean {
@@ -206,6 +210,20 @@ export function createSyncCoordinator(
         trigger,
         pendingCount,
         message: "This local workspace belongs to a different user",
+      });
+      return;
+    }
+
+    const unresolvedConflicts = (await listConflicts(
+      options.database,
+      ownerScope,
+    )).filter((conflict) => conflict.status === "unresolved");
+    if (unresolvedConflicts.length > 0) {
+      publish({
+        phase: "conflict",
+        trigger,
+        pendingCount,
+        message: "Cloud changes need review before synchronization can continue",
       });
       return;
     }
@@ -413,7 +431,8 @@ export function createSyncCoordinator(
       }
     }
 
-    const remaining = await listOutbox(options.database, ownerScope);
+    const remaining = (await listOutbox(options.database, ownerScope))
+      .filter(isOutboxMutationActionable);
     pendingCount = remaining.length;
     const unresolvedConflict = remaining.some(
       (mutation) => mutation.status === "conflict",

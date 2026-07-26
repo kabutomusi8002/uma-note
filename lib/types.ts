@@ -241,6 +241,10 @@ export const DEFAULT_USER_SETTINGS: Readonly<UserSettings> = {
  */
 export interface RaceRecord {
   id: string;
+  /** PostgreSQL UUID assigned to this race after the first successful cloud sync. */
+  cloudId?: string;
+  /** Last cloud sync_version durably acknowledged by this local workspace. */
+  syncVersion?: number;
   /**
    * Immutable client-generated identity used by the cloud sync protocol.
    *

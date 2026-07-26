@@ -34,7 +34,36 @@ export type OutboxStatus =
   | "syncing"
   | "retry"
   | "conflict"
-  | "failed";
+  | "failed"
+  | "superseded_stale"
+  | "resolved_superseded"
+  | "superseded_invalid_lineage"
+  | "applied_audited";
+
+export type TerminalOutboxStatus =
+  | "superseded_stale"
+  | "resolved_superseded"
+  | "superseded_invalid_lineage"
+  | "applied_audited";
+
+export interface OutboxAuditRecord {
+  status: TerminalOutboxStatus;
+  convergedAt: string;
+  cloudId: string;
+  cloudVersion: number;
+  reason: string;
+  replacementMutationId?: string;
+  receiptMutationId?: string;
+  changeSequence?: number;
+}
+
+export interface VerifiedReceiptRebase {
+  kind: "verified-receipt";
+  receiptMutationId: string;
+  cloudId: string;
+  cloudVersion: number;
+  reason: string;
+}
 
 /**
  * A durable, idempotent write intent. `baseSnapshot` is the cloud value the
@@ -42,6 +71,8 @@ export type OutboxStatus =
  */
 export interface OutboxMutation<T = unknown> {
   mutationId: string;
+  /** Links a replacement write to the safely retired mutation it supersedes. */
+  predecessorMutationId?: string;
   ownerScope: OwnerScope;
   entityType: SyncEntityType;
   entityKey: string;
@@ -52,6 +83,15 @@ export interface OutboxMutation<T = unknown> {
   /** Optional optimistic version of a parent aggregate, such as a rule set. */
   expectedParentVersion?: number | null;
   status: OutboxStatus;
+  /**
+   * A manual-review mutation is a valid future write, but the automatic
+   * coordinator must not transmit it until a later explicit decision.
+   */
+  deliveryPolicy?: "automatic" | "manual-review";
+  /** Durable evidence for an explicitly rebased mutation. */
+  rebase?: VerifiedReceiptRebase;
+  /** Terminal audit evidence retained instead of physically deleting history. */
+  audit?: OutboxAuditRecord;
   attempts: number;
   nextAttemptAt: string;
   createdAt: string;
@@ -93,7 +133,7 @@ export interface SyncConflict {
   status: "unresolved" | "resolved";
   createdAt: string;
   resolvedAt?: string;
-  resolution?: "local" | "remote" | "merged" | "exported";
+  resolution?: "local" | "remote" | "merged" | "exported" | "superseded";
 }
 
 export interface RemoteChange<T = unknown> {

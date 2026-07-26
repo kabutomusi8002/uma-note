@@ -537,6 +537,10 @@ export function databaseRecordToRace(raw: unknown): RaceRecord {
 
   return {
     id: clientRaceId,
+    ...(text(record.id) ? { cloudId: text(record.id) } : {}),
+    ...(numberValue(record.sync_version) > 0
+      ? { syncVersion: numberValue(record.sync_version) }
+      : {}),
     clientKey: clientRaceId,
     dataScope,
     ...(raceStatus ? { status: raceStatus } : {}),
@@ -656,6 +660,72 @@ export interface RaceSyncEnvelope {
   clientKey: string;
   version: number;
   changeSequence: number;
+}
+
+export async function loadRaceSyncEnvelopeByClientKey(
+  client: SupabaseClient,
+  clientKey: string,
+): Promise<RaceSyncEnvelope | null> {
+  const rows = await client
+    .from("races")
+    .select("id,client_key,sync_version")
+    .eq("client_key", clientKey)
+    .limit(2);
+  if (rows.error) {
+    throw repositoryError("クラウドレースの確認に失敗しました", rows.error);
+  }
+  if (!rows.data?.length) return null;
+  if (rows.data.length !== 1) {
+    throw new Error("同一clientKeyのクラウドレースが複数存在します");
+  }
+  const row = object(rows.data[0]);
+  const cloudId = text(row.id);
+  const record = await client.rpc("build_synced_race_record", {
+    p_race_id: cloudId,
+  });
+  if (record.error) {
+    throw repositoryError("クラウドレース内容の確認に失敗しました", record.error);
+  }
+  const envelope = syncEnvelope({
+    record: {
+      ...object(record.data),
+      id: cloudId,
+      client_key: text(row.client_key),
+      sync_version: numberValue(row.sync_version),
+    },
+    entity_id: cloudId,
+    client_key: text(row.client_key),
+    version: numberValue(row.sync_version),
+    change_seq: 0,
+  });
+  return envelope;
+}
+
+export async function findRaceMutationReceipt(
+  client: SupabaseClient,
+  input: { mutationId: string; clientKey: string },
+): Promise<{ cloudId: string; version: number } | null> {
+  const receipt = await client
+    .from("sync_mutation_receipts")
+    .select("entity_id,entity_client_key,resulting_version")
+    .eq("mutation_id", input.mutationId)
+    .eq("operation", "sync_race_record")
+    .limit(2);
+  if (receipt.error) {
+    throw repositoryError("mutation receiptの確認に失敗しました", receipt.error);
+  }
+  if (!receipt.data?.length) return null;
+  if (receipt.data.length !== 1) {
+    throw new Error("同一mutationのreceiptが複数存在します");
+  }
+  const row = object(receipt.data[0]);
+  if (text(row.entity_client_key) !== input.clientKey) {
+    throw new Error("receiptのclientKeyがOutboxと一致しません");
+  }
+  return {
+    cloudId: text(row.entity_id),
+    version: numberValue(row.resulting_version),
+  };
 }
 
 export type RaceSyncResult =

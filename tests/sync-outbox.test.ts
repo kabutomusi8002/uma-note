@@ -4,6 +4,7 @@ import {
   listConflicts,
   listOutbox,
   openLocalDatabase,
+  putConflict,
 } from "../lib/storage/local-db";
 import { createSyncCoordinator } from "../lib/sync/coordinator";
 import {
@@ -12,6 +13,8 @@ import {
   coalesceOutboxMutation,
   createOutboxMutation,
   isMutationDue,
+  isOutboxMutationActionable,
+  isTerminalOutboxStatus,
   isOwnerAuthorized,
   markMutationForRetry,
 } from "../lib/sync/outbox";
@@ -51,6 +54,44 @@ async function eventually(assertion: () => void, attempts = 30): Promise<void> {
 }
 
 describe("outbox policy", () => {
+  it("keeps a verified rebase held until an explicit later decision", () => {
+    const held = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: "race-a",
+        payload: { id: "race-a", clientKey: "race-a", dataScope: "test" },
+        expectedVersion: 1,
+        deliveryPolicy: "manual-review",
+        rebase: {
+          kind: "verified-receipt",
+          receiptMutationId: "base-receipt",
+          cloudId: "cloud-race",
+          cloudVersion: 1,
+          reason: "verified rebase",
+        },
+      },
+      { randomUUID: () => "held-rebase" },
+    );
+
+    expect(isOutboxMutationActionable(held)).toBe(true);
+    expect(isMutationDue(held, new Date("2026-07-26T00:00:00.000Z"))).toBe(false);
+  });
+
+  it("never treats terminal audit history as actionable", () => {
+    for (const status of [
+      "superseded_stale",
+      "resolved_superseded",
+      "superseded_invalid_lineage",
+      "applied_audited",
+    ] as const) {
+      const archived = { ...mutation(), status };
+      expect(isTerminalOutboxStatus(status)).toBe(true);
+      expect(isOutboxMutationActionable(archived)).toBe(false);
+      expect(isMutationDue(archived)).toBe(false);
+    }
+  });
+
   it("uses bounded exponential backoff with deterministic jitter", () => {
     expect(
       calculateRetryDelay(1, {
@@ -246,6 +287,51 @@ describe("sync coordinator", () => {
       reconciliation: "conflict",
       status: "unresolved",
     });
+    expect(coordinator.getStatus().phase).toBe("conflict");
+  });
+
+  it("does not push any successor while an unresolved conflict exists", async () => {
+    const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
+    const successor = {
+      ...mutation(),
+      mutationId: "successor-a",
+      predecessorMutationId: "already-applied-a",
+    };
+    await enqueueMutation(database, successor);
+    await putConflict(database, {
+      conflictId: "unresolved-a",
+      mutationId: "different-original",
+      ownerScope: OWNER,
+      entityType: "race",
+      entityKey: "race-a",
+      expectedVersion: 0,
+      remoteVersion: 1,
+      baseSnapshot: null,
+      localSnapshot: { name: "local" },
+      remoteSnapshot: { name: "cloud" },
+      reconciliation: "conflict",
+      fields: [],
+      status: "unresolved",
+      createdAt: "2026-07-26T00:00:00.000Z",
+    });
+    const pull = vi.fn(async () => ({ changes: [] }));
+    const push = vi.fn(async (): Promise<PushResult> => ({
+      status: "applied",
+      cloudVersion: 2,
+    }));
+    const coordinator = createSyncCoordinator({
+      database,
+      getOwnerScope: () => OWNER,
+      getAuthState: () => ({ status: "authenticated", userId: "user-a" }),
+      pull,
+      push,
+    });
+
+    await coordinator.flush("manual");
+
+    expect(pull).not.toHaveBeenCalled();
+    expect(push).not.toHaveBeenCalled();
+    expect(await listOutbox(database, OWNER)).toEqual([successor]);
     expect(coordinator.getStatus().phase).toBe("conflict");
   });
 

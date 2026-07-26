@@ -2,6 +2,7 @@ import type {
   OutboxMutation,
   OwnerScope,
   SyncConflict,
+  TerminalOutboxStatus,
   WorkspaceSnapshot,
 } from "../sync/types";
 import type { RaceRecord } from "../types";
@@ -36,6 +37,86 @@ interface LocalStorageState {
   metadata: Record<string, unknown>;
 }
 
+export interface SyncSafetyBackup {
+  format: "UMA_NOTE_OUTBOX_SAFETY_BACKUP_V1";
+  createdAt: string;
+  ownerScope: OwnerScope;
+  workspace: WorkspaceSnapshot | null;
+  outbox: OutboxMutation[];
+  conflicts: SyncConflict[];
+}
+
+export interface SyncResolutionCommit {
+  workspace: WorkspaceSnapshot;
+  originalMutationId: string;
+  entityType: OutboxMutation["entityType"];
+  entityKey: string;
+  successor?: OutboxMutation;
+  /** Already-durable successors replaced by this explicit user decision. */
+  supersededMutationIds?: string[];
+  resolvedConflict?: SyncConflict;
+}
+
+export interface SyncResolutionCommitResult {
+  successor: OutboxMutation | null;
+  originalRemoved: boolean;
+}
+
+export interface RaceOutboxConvergenceItem {
+  mutationId: string;
+  expectedStatus: OutboxMutation["status"];
+  terminalStatus: TerminalOutboxStatus;
+  reason: string;
+}
+
+export interface RaceOutboxConvergenceInput {
+  workspace: WorkspaceSnapshot;
+  entityKey: string;
+  cloudId: string;
+  cloudVersion: number;
+  verifiedReceiptMutationId: string;
+  items: RaceOutboxConvergenceItem[];
+  rebase?: OutboxMutation<RaceRecord>;
+  convergedAt: string;
+}
+
+export interface RaceOutboxConvergenceResult {
+  archivedCount: number;
+  resolvedConflictCount: number;
+  rebase: OutboxMutation<RaceRecord> | null;
+}
+
+export interface HeldRebaseConflictSettlementInput {
+  ownerScope: OwnerScope;
+  mutationId: string;
+  entityKey: string;
+  cloudId: string;
+  cloudVersion: number;
+  settledAt: string;
+}
+
+export interface HeldRebaseConflictSettlementResult {
+  mutation: OutboxMutation;
+  resolvedConflictCount: number;
+}
+
+export interface AppliedRebaseCommitInput {
+  workspace: WorkspaceSnapshot;
+  mutationId: string;
+  entityKey: string;
+  cloudId: string;
+  expectedVersion: number;
+  resultingVersion: number;
+  receiptMutationId: string;
+  changeSequence: number;
+  completedAt: string;
+}
+
+export interface AppliedRebaseCommitResult {
+  mutation: OutboxMutation;
+  workspace: WorkspaceSnapshot;
+}
+
 interface LocalDatabaseAdapter {
   readonly backend: BackendKind;
   getWorkspace(ownerScope: OwnerScope): Promise<WorkspaceSnapshot | null>;
@@ -56,6 +137,22 @@ interface LocalDatabaseAdapter {
     conflict: SyncConflict,
     successor?: OutboxMutation,
   ): Promise<OutboxMutation | null>;
+  exportSyncSafetyBackup(
+    ownerScope: OwnerScope,
+    now: Date,
+  ): Promise<SyncSafetyBackup>;
+  commitSyncResolution(
+    input: SyncResolutionCommit,
+  ): Promise<SyncResolutionCommitResult>;
+  convergeRaceOutbox(
+    input: RaceOutboxConvergenceInput,
+  ): Promise<RaceOutboxConvergenceResult>;
+  settleHeldRebaseConflict(
+    input: HeldRebaseConflictSettlementInput,
+  ): Promise<HeldRebaseConflictSettlementResult>;
+  commitAppliedRebase(
+    input: AppliedRebaseCommitInput,
+  ): Promise<AppliedRebaseCommitResult>;
   getMetadata(key: string): Promise<unknown>;
   setMetadata(key: string, value: unknown): Promise<void>;
   close(): void;
@@ -421,6 +518,348 @@ class IndexedDatabaseAdapter implements LocalDatabaseAdapter {
     });
   }
 
+  async exportSyncSafetyBackup(
+    ownerScope: OwnerScope,
+    now: Date,
+  ): Promise<SyncSafetyBackup> {
+    return this.read(
+      ["workspaces", "outbox", "conflicts"],
+      async (transaction) => {
+        const workspace = await requestResult(
+          transaction.objectStore("workspaces").get(ownerScope),
+        );
+        const outbox = await requestResult(
+          transaction.objectStore("outbox").index("ownerScope").getAll(ownerScope),
+        );
+        const conflicts = await requestResult(
+          transaction.objectStore("conflicts").index("ownerScope").getAll(ownerScope),
+        );
+        return {
+          format: "UMA_NOTE_OUTBOX_SAFETY_BACKUP_V1",
+          createdAt: now.toISOString(),
+          ownerScope,
+          workspace: (workspace as WorkspaceSnapshot | undefined) ?? null,
+          outbox: outbox as OutboxMutation[],
+          conflicts: conflicts as SyncConflict[],
+        };
+      },
+    );
+  }
+
+  async commitSyncResolution(
+    input: SyncResolutionCommit,
+  ): Promise<SyncResolutionCommitResult> {
+    return this.write(
+      ["workspaces", "outbox", "conflicts"],
+      async (transaction) => {
+        const outboxStore = transaction.objectStore("outbox");
+        const original = (await requestResult(
+          outboxStore.get(input.originalMutationId),
+        )) as OutboxMutation | undefined;
+        if (!original) {
+          throw new Error("The original Outbox mutation no longer exists");
+        }
+        if (
+          original.ownerScope !== input.workspace.ownerScope ||
+          original.entityType !== input.entityType ||
+          original.entityKey !== input.entityKey
+        ) {
+          throw new Error("The original Outbox mutation identity changed");
+        }
+
+        let successor: OutboxMutation | null = null;
+        if (input.successor) {
+          const candidate = input.successor;
+          if (
+            candidate.mutationId === original.mutationId ||
+            candidate.predecessorMutationId !== original.mutationId ||
+            candidate.ownerScope !== original.ownerScope ||
+            candidate.entityType !== original.entityType ||
+            candidate.entityKey !== original.entityKey
+          ) {
+            throw new Error("The successor mutation is not safely linked");
+          }
+          const matching = (await requestResult(
+            outboxStore
+              .index("ownerEntity")
+              .getAll([original.ownerScope, original.entityType, original.entityKey]),
+          )) as OutboxMutation[];
+          const existingSuccessor = matching.find(
+            (item) => item.predecessorMutationId === original.mutationId,
+          );
+          successor = existingSuccessor ?? candidate;
+          if (!existingSuccessor) {
+            await requestResult(outboxStore.put(clone(candidate)));
+          }
+        }
+
+        if (input.resolvedConflict) {
+          if (
+            input.resolvedConflict.mutationId !== original.mutationId ||
+            input.resolvedConflict.status !== "resolved" ||
+            !input.resolvedConflict.resolution
+          ) {
+            throw new Error("The conflict resolution is incomplete");
+          }
+          await requestResult(
+            transaction.objectStore("conflicts").put(
+              clone(input.resolvedConflict),
+            ),
+          );
+        }
+        await requestResult(
+          transaction.objectStore("workspaces").put(clone(input.workspace)),
+        );
+        for (const mutationId of input.supersededMutationIds ?? []) {
+          if (mutationId === original.mutationId) {
+            throw new Error("The original mutation cannot supersede itself");
+          }
+          const superseded = (await requestResult(
+            outboxStore.get(mutationId),
+          )) as OutboxMutation | undefined;
+          if (
+            !superseded ||
+            !superseded.predecessorMutationId ||
+            superseded.ownerScope !== original.ownerScope ||
+            superseded.entityType !== original.entityType ||
+            superseded.entityKey !== original.entityKey
+          ) {
+            throw new Error("A superseded mutation is not a linked successor");
+          }
+          await requestResult(outboxStore.delete(mutationId));
+        }
+        await requestResult(outboxStore.delete(original.mutationId));
+        return { successor, originalRemoved: true };
+      },
+    );
+  }
+
+  async convergeRaceOutbox(
+    input: RaceOutboxConvergenceInput,
+  ): Promise<RaceOutboxConvergenceResult> {
+    return this.write(
+      ["workspaces", "outbox", "conflicts"],
+      async (transaction) => {
+        const outboxStore = transaction.objectStore("outbox");
+        const matching = (await requestResult(
+          outboxStore
+            .index("ownerEntity")
+            .getAll([input.workspace.ownerScope, "race", input.entityKey]),
+        )) as OutboxMutation[];
+        const expectedIds = new Set(input.items.map((item) => item.mutationId));
+        if (
+          expectedIds.size !== input.items.length ||
+          matching.length !== input.items.length ||
+          matching.some((mutation) => !expectedIds.has(mutation.mutationId))
+        ) {
+          throw new Error("The race Outbox changed before convergence");
+        }
+
+        const converged: OutboxMutation[] = [];
+        for (const item of input.items) {
+          const mutation = matching.find(
+            (candidate) => candidate.mutationId === item.mutationId,
+          );
+          if (!mutation || mutation.status !== item.expectedStatus) {
+            throw new Error("An Outbox mutation changed before convergence");
+          }
+          const archived: OutboxMutation = {
+            ...mutation,
+            status: item.terminalStatus,
+            audit: {
+              status: item.terminalStatus,
+              convergedAt: input.convergedAt,
+              cloudId: input.cloudId,
+              cloudVersion: input.cloudVersion,
+              reason: item.reason,
+              ...(input.rebase
+                ? { replacementMutationId: input.rebase.mutationId }
+                : {}),
+            },
+            updatedAt: input.convergedAt,
+            inFlightAt: undefined,
+            lastError: item.reason,
+          };
+          await requestResult(outboxStore.put(clone(archived)));
+          converged.push(archived);
+        }
+
+        let rebase: OutboxMutation<RaceRecord> | null = null;
+        if (input.rebase) {
+          const candidate = input.rebase;
+          const payload = objectValue(candidate.payload);
+          if (
+            candidate.ownerScope !== input.workspace.ownerScope ||
+            candidate.entityType !== "race" ||
+            candidate.entityKey !== input.entityKey ||
+            candidate.status !== "pending" ||
+            candidate.deliveryPolicy !== "manual-review" ||
+            candidate.expectedVersion !== input.cloudVersion ||
+            candidate.predecessorMutationId !== undefined ||
+            candidate.rebase?.kind !== "verified-receipt" ||
+            candidate.rebase.receiptMutationId !==
+              input.verifiedReceiptMutationId ||
+            candidate.rebase.cloudId !== input.cloudId ||
+            candidate.rebase.cloudVersion !== input.cloudVersion ||
+            nonEmptyString(payload?.clientKey) !== input.entityKey ||
+            payload?.dataScope !== "test" ||
+            expectedIds.has(candidate.mutationId)
+          ) {
+            throw new Error("The rebased mutation is not safely anchored");
+          }
+          const sameId = await requestResult(outboxStore.get(candidate.mutationId));
+          if (sameId) throw new Error("The rebased mutation id already exists");
+          await requestResult(outboxStore.put(clone(candidate)));
+          rebase = clone(candidate);
+        }
+
+        const conflictStore = transaction.objectStore("conflicts");
+        const conflicts = (await requestResult(
+          conflictStore.index("ownerScope").getAll(input.workspace.ownerScope),
+        )) as SyncConflict[];
+        let resolvedConflictCount = 0;
+        for (const conflict of conflicts) {
+          if (
+            conflict.status === "unresolved" &&
+            expectedIds.has(conflict.mutationId)
+          ) {
+            await requestResult(conflictStore.put(clone({
+              ...conflict,
+              status: "resolved",
+              resolution: "superseded",
+              resolvedAt: input.convergedAt,
+            })));
+            resolvedConflictCount += 1;
+          }
+        }
+        await requestResult(
+          transaction.objectStore("workspaces").put(clone(input.workspace)),
+        );
+        return {
+          archivedCount: converged.length,
+          resolvedConflictCount,
+          rebase,
+        };
+      },
+    );
+  }
+
+  async settleHeldRebaseConflict(
+    input: HeldRebaseConflictSettlementInput,
+  ): Promise<HeldRebaseConflictSettlementResult> {
+    return this.write(["outbox", "conflicts"], async (transaction) => {
+      const outboxStore = transaction.objectStore("outbox");
+      const mutation = (await requestResult(
+        outboxStore.get(input.mutationId),
+      )) as OutboxMutation | undefined;
+      if (
+        !mutation ||
+        mutation.ownerScope !== input.ownerScope ||
+        mutation.entityType !== "race" ||
+        mutation.entityKey !== input.entityKey ||
+        mutation.status !== "conflict" ||
+        mutation.deliveryPolicy !== "manual-review" ||
+        mutation.expectedVersion !== input.cloudVersion ||
+        mutation.rebase?.kind !== "verified-receipt" ||
+        mutation.rebase.cloudId !== input.cloudId ||
+        mutation.rebase.cloudVersion !== input.cloudVersion
+      ) {
+        throw new Error("The held rebase conflict evidence changed");
+      }
+      const conflictStore = transaction.objectStore("conflicts");
+      const conflicts = (await requestResult(
+        conflictStore.index("ownerScope").getAll(input.ownerScope),
+      )) as SyncConflict[];
+      const matching = conflicts.filter(
+        (conflict) =>
+          conflict.mutationId === input.mutationId &&
+          conflict.status === "unresolved" &&
+          conflict.entityType === "race" &&
+          conflict.entityKey === input.entityKey &&
+          conflict.remoteVersion === input.cloudVersion &&
+          conflict.remoteSnapshot !== null,
+      );
+      if (matching.length !== 1) {
+        throw new Error("The held rebase conflict is not uniquely verifiable");
+      }
+      const restored: OutboxMutation = {
+        ...mutation,
+        status: "pending",
+        updatedAt: input.settledAt,
+        inFlightAt: undefined,
+        lastError: undefined,
+      };
+      await requestResult(outboxStore.put(clone(restored)));
+      await requestResult(conflictStore.put(clone({
+        ...matching[0]!,
+        status: "resolved",
+        resolution: "superseded",
+        resolvedAt: input.settledAt,
+      })));
+      return { mutation: restored, resolvedConflictCount: 1 };
+    });
+  }
+
+  async commitAppliedRebase(
+    input: AppliedRebaseCommitInput,
+  ): Promise<AppliedRebaseCommitResult> {
+    return this.write(["workspaces", "outbox"], async (transaction) => {
+      const outboxStore = transaction.objectStore("outbox");
+      const mutation = (await requestResult(
+        outboxStore.get(input.mutationId),
+      )) as OutboxMutation | undefined;
+      const payload = objectValue(mutation?.payload);
+      const persistedRace = input.workspace.races.find(
+        (race) => race.clientKey === input.entityKey,
+      );
+      if (
+        !mutation ||
+        mutation.ownerScope !== input.workspace.ownerScope ||
+        mutation.entityType !== "race" ||
+        mutation.entityKey !== input.entityKey ||
+        mutation.status !== "pending" ||
+        mutation.deliveryPolicy !== "manual-review" ||
+        mutation.expectedVersion !== input.expectedVersion ||
+        mutation.rebase?.kind !== "verified-receipt" ||
+        mutation.rebase.cloudId !== input.cloudId ||
+        mutation.rebase.cloudVersion !== input.expectedVersion ||
+        input.receiptMutationId !== mutation.mutationId ||
+        input.resultingVersion !== input.expectedVersion + 1 ||
+        input.changeSequence < 1 ||
+        nonEmptyString(payload?.clientKey) !== input.entityKey ||
+        payload?.dataScope !== "test" ||
+        !persistedRace ||
+        persistedRace.clientKey !== input.entityKey ||
+        persistedRace.dataScope !== "test" ||
+        persistedRace.cloudId !== input.cloudId ||
+        persistedRace.syncVersion !== input.resultingVersion
+      ) {
+        throw new Error("Applied rebase evidence is incomplete");
+      }
+      const applied: OutboxMutation = {
+        ...mutation,
+        status: "applied_audited",
+        audit: {
+          status: "applied_audited",
+          convergedAt: input.completedAt,
+          cloudId: input.cloudId,
+          cloudVersion: input.resultingVersion,
+          reason: "Verified receipt and change log; retained as applied audit history.",
+          receiptMutationId: input.receiptMutationId,
+          changeSequence: input.changeSequence,
+        },
+        updatedAt: input.completedAt,
+        inFlightAt: undefined,
+        lastError: undefined,
+      };
+      await requestResult(outboxStore.put(clone(applied)));
+      await requestResult(
+        transaction.objectStore("workspaces").put(clone(input.workspace)),
+      );
+      return { mutation: applied, workspace: clone(input.workspace) };
+    });
+  }
+
   async getMetadata(key: string): Promise<unknown> {
     return this.read("metadata", async (transaction) => {
       const record = (await requestResult(
@@ -598,6 +1037,299 @@ class StateDatabaseAdapter implements LocalDatabaseAdapter {
         : successor;
       draft.outbox[result.mutationId] = clone(result);
       return result;
+    });
+  }
+
+  exportSyncSafetyBackup(
+    ownerScope: OwnerScope,
+    now: Date,
+  ): Promise<SyncSafetyBackup> {
+    return this.afterQueued(() => ({
+      format: "UMA_NOTE_OUTBOX_SAFETY_BACKUP_V1",
+      createdAt: now.toISOString(),
+      ownerScope,
+      workspace: clone(this.state.workspaces[ownerScope] ?? null),
+      outbox: Object.values(this.state.outbox).filter(
+        (mutation) => mutation.ownerScope === ownerScope,
+      ),
+      conflicts: Object.values(this.state.conflicts).filter(
+        (conflict) => conflict.ownerScope === ownerScope,
+      ),
+    }));
+  }
+
+  commitSyncResolution(
+    input: SyncResolutionCommit,
+  ): Promise<SyncResolutionCommitResult> {
+    return this.mutate((draft) => {
+      const original = draft.outbox[input.originalMutationId];
+      if (!original) {
+        throw new Error("The original Outbox mutation no longer exists");
+      }
+      if (
+        original.ownerScope !== input.workspace.ownerScope ||
+        original.entityType !== input.entityType ||
+        original.entityKey !== input.entityKey
+      ) {
+        throw new Error("The original Outbox mutation identity changed");
+      }
+
+      let successor: OutboxMutation | null = null;
+      if (input.successor) {
+        const candidate = input.successor;
+        if (
+          candidate.mutationId === original.mutationId ||
+          candidate.predecessorMutationId !== original.mutationId ||
+          candidate.ownerScope !== original.ownerScope ||
+          candidate.entityType !== original.entityType ||
+          candidate.entityKey !== original.entityKey
+        ) {
+          throw new Error("The successor mutation is not safely linked");
+        }
+        const matching = Object.values(draft.outbox).filter(
+          (item) =>
+            item.ownerScope === original.ownerScope &&
+            item.entityType === original.entityType &&
+            item.entityKey === original.entityKey,
+        );
+        const existingSuccessor = matching.find(
+          (item) => item.predecessorMutationId === original.mutationId,
+        );
+        successor = existingSuccessor ?? candidate;
+        draft.outbox[successor.mutationId] = clone(successor);
+      }
+
+      if (input.resolvedConflict) {
+        if (
+          input.resolvedConflict.mutationId !== original.mutationId ||
+          input.resolvedConflict.status !== "resolved" ||
+          !input.resolvedConflict.resolution
+        ) {
+          throw new Error("The conflict resolution is incomplete");
+        }
+        draft.conflicts[input.resolvedConflict.conflictId] =
+          clone(input.resolvedConflict);
+      }
+      draft.workspaces[input.workspace.ownerScope] = clone(input.workspace);
+      for (const mutationId of input.supersededMutationIds ?? []) {
+        if (mutationId === original.mutationId) {
+          throw new Error("The original mutation cannot supersede itself");
+        }
+        const superseded = draft.outbox[mutationId];
+        if (
+          !superseded ||
+          !superseded.predecessorMutationId ||
+          superseded.ownerScope !== original.ownerScope ||
+          superseded.entityType !== original.entityType ||
+          superseded.entityKey !== original.entityKey
+        ) {
+          throw new Error("A superseded mutation is not a linked successor");
+        }
+        delete draft.outbox[mutationId];
+      }
+      delete draft.outbox[original.mutationId];
+      return { successor, originalRemoved: true };
+    });
+  }
+
+  convergeRaceOutbox(
+    input: RaceOutboxConvergenceInput,
+  ): Promise<RaceOutboxConvergenceResult> {
+    return this.mutate((draft) => {
+      const matching = Object.values(draft.outbox).filter(
+        (mutation) =>
+          mutation.ownerScope === input.workspace.ownerScope &&
+          mutation.entityType === "race" &&
+          mutation.entityKey === input.entityKey,
+      );
+      const expectedIds = new Set(input.items.map((item) => item.mutationId));
+      if (
+        expectedIds.size !== input.items.length ||
+        matching.length !== input.items.length ||
+        matching.some((mutation) => !expectedIds.has(mutation.mutationId))
+      ) {
+        throw new Error("The race Outbox changed before convergence");
+      }
+
+      for (const item of input.items) {
+        const mutation = draft.outbox[item.mutationId];
+        if (!mutation || mutation.status !== item.expectedStatus) {
+          throw new Error("An Outbox mutation changed before convergence");
+        }
+        draft.outbox[item.mutationId] = clone({
+          ...mutation,
+          status: item.terminalStatus,
+          audit: {
+            status: item.terminalStatus,
+            convergedAt: input.convergedAt,
+            cloudId: input.cloudId,
+            cloudVersion: input.cloudVersion,
+            reason: item.reason,
+            ...(input.rebase
+              ? { replacementMutationId: input.rebase.mutationId }
+              : {}),
+          },
+          updatedAt: input.convergedAt,
+          inFlightAt: undefined,
+          lastError: item.reason,
+        });
+      }
+
+      let rebase: OutboxMutation<RaceRecord> | null = null;
+      if (input.rebase) {
+        const candidate = input.rebase;
+        const payload = objectValue(candidate.payload);
+        if (
+          candidate.ownerScope !== input.workspace.ownerScope ||
+          candidate.entityType !== "race" ||
+          candidate.entityKey !== input.entityKey ||
+          candidate.status !== "pending" ||
+          candidate.deliveryPolicy !== "manual-review" ||
+          candidate.expectedVersion !== input.cloudVersion ||
+          candidate.predecessorMutationId !== undefined ||
+          candidate.rebase?.kind !== "verified-receipt" ||
+          candidate.rebase.receiptMutationId !==
+            input.verifiedReceiptMutationId ||
+          candidate.rebase.cloudId !== input.cloudId ||
+          candidate.rebase.cloudVersion !== input.cloudVersion ||
+          nonEmptyString(payload?.clientKey) !== input.entityKey ||
+          payload?.dataScope !== "test" ||
+          expectedIds.has(candidate.mutationId) ||
+          draft.outbox[candidate.mutationId]
+        ) {
+          throw new Error("The rebased mutation is not safely anchored");
+        }
+        draft.outbox[candidate.mutationId] = clone(candidate);
+        rebase = clone(candidate);
+      }
+
+      let resolvedConflictCount = 0;
+      for (const [conflictId, conflict] of Object.entries(draft.conflicts)) {
+        if (
+          conflict.ownerScope === input.workspace.ownerScope &&
+          conflict.status === "unresolved" &&
+          expectedIds.has(conflict.mutationId)
+        ) {
+          draft.conflicts[conflictId] = clone({
+            ...conflict,
+            status: "resolved",
+            resolution: "superseded",
+            resolvedAt: input.convergedAt,
+          });
+          resolvedConflictCount += 1;
+        }
+      }
+      draft.workspaces[input.workspace.ownerScope] = clone(input.workspace);
+      return {
+        archivedCount: input.items.length,
+        resolvedConflictCount,
+        rebase,
+      };
+    });
+  }
+
+  settleHeldRebaseConflict(
+    input: HeldRebaseConflictSettlementInput,
+  ): Promise<HeldRebaseConflictSettlementResult> {
+    return this.mutate((draft) => {
+      const mutation = draft.outbox[input.mutationId];
+      if (
+        !mutation ||
+        mutation.ownerScope !== input.ownerScope ||
+        mutation.entityType !== "race" ||
+        mutation.entityKey !== input.entityKey ||
+        mutation.status !== "conflict" ||
+        mutation.deliveryPolicy !== "manual-review" ||
+        mutation.expectedVersion !== input.cloudVersion ||
+        mutation.rebase?.kind !== "verified-receipt" ||
+        mutation.rebase.cloudId !== input.cloudId ||
+        mutation.rebase.cloudVersion !== input.cloudVersion
+      ) {
+        throw new Error("The held rebase conflict evidence changed");
+      }
+      const matching = Object.values(draft.conflicts).filter(
+        (conflict) =>
+          conflict.mutationId === input.mutationId &&
+          conflict.status === "unresolved" &&
+          conflict.entityType === "race" &&
+          conflict.entityKey === input.entityKey &&
+          conflict.remoteVersion === input.cloudVersion &&
+          conflict.remoteSnapshot !== null,
+      );
+      if (matching.length !== 1) {
+        throw new Error("The held rebase conflict is not uniquely verifiable");
+      }
+      const restored: OutboxMutation = {
+        ...mutation,
+        status: "pending",
+        updatedAt: input.settledAt,
+        inFlightAt: undefined,
+        lastError: undefined,
+      };
+      draft.outbox[mutation.mutationId] = clone(restored);
+      const conflict = matching[0]!;
+      draft.conflicts[conflict.conflictId] = clone({
+        ...conflict,
+        status: "resolved",
+        resolution: "superseded",
+        resolvedAt: input.settledAt,
+      });
+      return { mutation: restored, resolvedConflictCount: 1 };
+    });
+  }
+
+  commitAppliedRebase(
+    input: AppliedRebaseCommitInput,
+  ): Promise<AppliedRebaseCommitResult> {
+    return this.mutate((draft) => {
+      const mutation = draft.outbox[input.mutationId];
+      const payload = objectValue(mutation?.payload);
+      const persistedRace = input.workspace.races.find(
+        (race) => race.clientKey === input.entityKey,
+      );
+      if (
+        !mutation ||
+        mutation.ownerScope !== input.workspace.ownerScope ||
+        mutation.entityType !== "race" ||
+        mutation.entityKey !== input.entityKey ||
+        mutation.status !== "pending" ||
+        mutation.deliveryPolicy !== "manual-review" ||
+        mutation.expectedVersion !== input.expectedVersion ||
+        mutation.rebase?.kind !== "verified-receipt" ||
+        mutation.rebase.cloudId !== input.cloudId ||
+        mutation.rebase.cloudVersion !== input.expectedVersion ||
+        input.receiptMutationId !== mutation.mutationId ||
+        input.resultingVersion !== input.expectedVersion + 1 ||
+        input.changeSequence < 1 ||
+        nonEmptyString(payload?.clientKey) !== input.entityKey ||
+        payload?.dataScope !== "test" ||
+        !persistedRace ||
+        persistedRace.clientKey !== input.entityKey ||
+        persistedRace.dataScope !== "test" ||
+        persistedRace.cloudId !== input.cloudId ||
+        persistedRace.syncVersion !== input.resultingVersion
+      ) {
+        throw new Error("Applied rebase evidence is incomplete");
+      }
+      const applied: OutboxMutation = {
+        ...mutation,
+        status: "applied_audited",
+        audit: {
+          status: "applied_audited",
+          convergedAt: input.completedAt,
+          cloudId: input.cloudId,
+          cloudVersion: input.resultingVersion,
+          reason: "Verified receipt and change log; retained as applied audit history.",
+          receiptMutationId: input.receiptMutationId,
+          changeSequence: input.changeSequence,
+        },
+        updatedAt: input.completedAt,
+        inFlightAt: undefined,
+        lastError: undefined,
+      };
+      draft.outbox[mutation.mutationId] = clone(applied);
+      draft.workspaces[input.workspace.ownerScope] = clone(input.workspace);
+      return { mutation: applied, workspace: clone(input.workspace) };
     });
   }
 
@@ -971,4 +1703,107 @@ export function resolveConflict(
       ? clone(normalizeRaceOutboxMutation(successor).mutation)
       : undefined,
   );
+}
+
+export function exportSyncSafetyBackup(
+  database: LocalDatabase,
+  ownerScope: OwnerScope,
+  now: Date = new Date(),
+): Promise<SyncSafetyBackup> {
+  return database[INTERNAL].exportSyncSafetyBackup(ownerScope, now);
+}
+
+/**
+ * Persists cloud identity/version metadata, an optional successor mutation,
+ * the resolved conflict marker, and retirement of the original mutation in
+ * one local transaction. Any failure leaves the original mutation untouched.
+ */
+export function commitSyncResolution(
+  database: LocalDatabase,
+  input: SyncResolutionCommit,
+): Promise<SyncResolutionCommitResult> {
+  if (input.workspace.ownerScope.trim() === "") {
+    return Promise.reject(new Error("A workspace owner is required"));
+  }
+  if (
+    input.successor &&
+    (input.successor.ownerScope !== input.workspace.ownerScope ||
+      input.successor.entityType !== input.entityType ||
+      input.successor.entityKey !== input.entityKey)
+  ) {
+    return Promise.reject(
+      new Error("The successor must target the same owner and entity"),
+    );
+  }
+  return database[INTERNAL].commitSyncResolution({
+    ...clone(input),
+    successor: input.successor
+      ? clone(normalizeRaceOutboxMutation(input.successor).mutation)
+      : undefined,
+  });
+}
+
+/**
+ * Retains stale/conflicted writes as terminal audit records and optionally
+ * appends one manually held, receipt-anchored rebase in the same transaction.
+ * No Outbox record is physically deleted.
+ */
+export function convergeRaceOutbox(
+  database: LocalDatabase,
+  input: RaceOutboxConvergenceInput,
+): Promise<RaceOutboxConvergenceResult> {
+  if (
+    input.workspace.ownerScope.trim() === "" ||
+    input.entityKey.trim() === "" ||
+    input.cloudId.trim() === "" ||
+    input.verifiedReceiptMutationId.trim() === "" ||
+    input.cloudVersion < 1 ||
+    input.items.length === 0
+  ) {
+    return Promise.reject(new Error("Race Outbox convergence evidence is incomplete"));
+  }
+  return database[INTERNAL].convergeRaceOutbox(clone(input));
+}
+
+/**
+ * Clears a pull-generated conflict for a verified, manually held rebase
+ * without deleting or transmitting the mutation.
+ */
+export function settleHeldRebaseConflict(
+  database: LocalDatabase,
+  input: HeldRebaseConflictSettlementInput,
+): Promise<HeldRebaseConflictSettlementResult> {
+  if (
+    input.ownerScope.trim() === "" ||
+    input.mutationId.trim() === "" ||
+    input.entityKey.trim() === "" ||
+    input.cloudId.trim() === "" ||
+    input.cloudVersion < 1
+  ) {
+    return Promise.reject(new Error("Held rebase evidence is incomplete"));
+  }
+  return database[INTERNAL].settleHeldRebaseConflict(clone(input));
+}
+
+/**
+ * Persists verified cloud v2 metadata and retires a manually held rebase into
+ * terminal audit history. The mutation is retained rather than deleted.
+ */
+export function commitAppliedRebase(
+  database: LocalDatabase,
+  input: AppliedRebaseCommitInput,
+): Promise<AppliedRebaseCommitResult> {
+  if (
+    input.workspace.ownerScope.trim() === "" ||
+    input.mutationId.trim() === "" ||
+    input.entityKey.trim() === "" ||
+    input.cloudId.trim() === "" ||
+    input.receiptMutationId.trim() === "" ||
+    input.expectedVersion < 1 ||
+    input.resultingVersion !== input.expectedVersion + 1 ||
+    input.changeSequence < 1
+  ) {
+    return Promise.reject(new Error("Applied rebase evidence is incomplete"));
+  }
+  return database[INTERNAL].commitAppliedRebase(clone(input));
 }

@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { createDemoRace, DEMO_RULE_VERSION } from "../lib/demo-data";
 import {
+  commitSyncResolution,
+  commitAppliedRebase,
+  convergeRaceOutbox,
   enqueueMutation,
+  exportSyncSafetyBackup,
   getWorkspace,
   listConflicts,
   listOutbox,
@@ -9,6 +13,7 @@ import {
   putConflict,
   replaceWorkspace,
   resolveConflict,
+  settleHeldRebaseConflict,
   updateOutbox,
 } from "../lib/storage/local-db";
 import { createOutboxMutation } from "../lib/sync/outbox";
@@ -58,6 +63,516 @@ function workspace(ownerScope: OwnerScope, name = "A"): WorkspaceSnapshot {
 }
 
 describe("LOCAL database", () => {
+  it("atomically archives stale race intents and appends one held verified rebase", async () => {
+    const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
+    const snapshot = workspace(OWNER, "convergence");
+    const race = {
+      ...snapshot.races[0]!,
+      dataScope: "test" as const,
+      cloudId: "cloud-race",
+      syncVersion: 1,
+    };
+    const storedWorkspace = { ...snapshot, races: [race] };
+    const statuses = ["failed", "failed", "conflict", "conflict"] as const;
+    const originals = statuses.map((status, index) => ({
+      ...createOutboxMutation(
+        {
+          ownerScope: OWNER,
+          entityType: "race",
+          entityKey: race.clientKey,
+          payload: race,
+          expectedVersion: index < 3 ? 0 : 1,
+        },
+        { randomUUID: () => `old-${index + 1}` },
+      ),
+      status,
+    }));
+    await replaceWorkspace(database, storedWorkspace, originals);
+    for (const mutation of originals.filter((item) => item.status === "conflict")) {
+      await putConflict(database, {
+        conflictId: `conflict-${mutation.mutationId}`,
+        mutationId: mutation.mutationId,
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: race.clientKey,
+        expectedVersion: mutation.expectedVersion,
+        remoteVersion: 1,
+        baseSnapshot: null,
+        localSnapshot: race,
+        remoteSnapshot: { ...race, name: "cloud" },
+        reconciliation: "conflict",
+        fields: [],
+        status: "unresolved",
+        createdAt: "2026-07-26T00:00:00.000Z",
+      });
+    }
+    const rebase = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: race.clientKey,
+        payload: race,
+        baseSnapshot: { ...race, name: "cloud" },
+        expectedVersion: 1,
+        deliveryPolicy: "manual-review",
+        rebase: {
+          kind: "verified-receipt",
+          receiptMutationId: "base-receipt",
+          cloudId: "cloud-race",
+          cloudVersion: 1,
+          reason: "rebuild lineage",
+        },
+      },
+      { randomUUID: () => "rebased-race" },
+    );
+
+    const result = await convergeRaceOutbox(database, {
+      workspace: storedWorkspace,
+      entityKey: race.clientKey,
+      cloudId: "cloud-race",
+      cloudVersion: 1,
+      verifiedReceiptMutationId: "base-receipt",
+      items: originals.map((mutation, index) => ({
+        mutationId: mutation.mutationId,
+        expectedStatus: mutation.status,
+        terminalStatus: index < 2
+          ? "superseded_stale"
+          : index === 2
+            ? "resolved_superseded"
+            : "superseded_invalid_lineage",
+        reason: "audited",
+      })),
+      rebase,
+      convergedAt: "2026-07-26T01:00:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      archivedCount: 4,
+      resolvedConflictCount: 2,
+      rebase: { mutationId: "rebased-race", status: "pending" },
+    });
+    expect(await listOutbox(database, OWNER)).toMatchObject([
+      { mutationId: "old-1", status: "superseded_stale" },
+      { mutationId: "old-2", status: "superseded_stale" },
+      { mutationId: "old-3", status: "resolved_superseded" },
+      { mutationId: "old-4", status: "superseded_invalid_lineage" },
+      {
+        mutationId: "rebased-race",
+        status: "pending",
+        deliveryPolicy: "manual-review",
+        rebase: {
+          kind: "verified-receipt",
+          receiptMutationId: "base-receipt",
+        },
+      },
+    ]);
+    expect(await listConflicts(database, OWNER)).toMatchObject([
+      { status: "resolved", resolution: "superseded" },
+      { status: "resolved", resolution: "superseded" },
+    ]);
+  });
+
+  it("leaves all original intents untouched when convergence evidence is invalid", async () => {
+    const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
+    const snapshot = workspace(OWNER, "invalid-convergence");
+    const race = { ...snapshot.races[0]!, dataScope: "test" as const };
+    const original = {
+      ...createOutboxMutation(
+        {
+          ownerScope: OWNER,
+          entityType: "race",
+          entityKey: race.clientKey,
+          payload: race,
+          expectedVersion: 0,
+        },
+        { randomUUID: () => "old-invalid" },
+      ),
+      status: "failed" as const,
+    };
+    await replaceWorkspace(database, { ...snapshot, races: [race] }, [original]);
+
+    await expect(convergeRaceOutbox(database, {
+      workspace: { ...snapshot, races: [race] },
+      entityKey: race.clientKey,
+      cloudId: "cloud-race",
+      cloudVersion: 1,
+      verifiedReceiptMutationId: "base-receipt",
+      items: [{
+        mutationId: original.mutationId,
+        expectedStatus: "conflict",
+        terminalStatus: "superseded_stale",
+        reason: "audited",
+      }],
+      convergedAt: "2026-07-26T01:00:00.000Z",
+    })).rejects.toThrow("changed before convergence");
+    expect(await listOutbox(database, OWNER)).toEqual([original]);
+  });
+
+  it("atomically restores a held rebase after a verified pull-only conflict", async () => {
+    const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
+    const snapshot = workspace(OWNER, "held-conflict");
+    const race = { ...snapshot.races[0]!, dataScope: "test" as const };
+    const held = {
+      ...createOutboxMutation(
+        {
+          ownerScope: OWNER,
+          entityType: "race",
+          entityKey: race.clientKey,
+          payload: race,
+          expectedVersion: 1,
+          deliveryPolicy: "manual-review",
+          rebase: {
+            kind: "verified-receipt" as const,
+            receiptMutationId: "base-receipt",
+            cloudId: "cloud-race",
+            cloudVersion: 1,
+            reason: "verified rebase",
+          },
+        },
+        { randomUUID: () => "held-mutation" },
+      ),
+      status: "conflict" as const,
+      lastError: "Cloud changed while this device had a local value",
+    };
+    const conflict: SyncConflict = {
+      conflictId: "held-conflict",
+      mutationId: held.mutationId,
+      ownerScope: OWNER,
+      entityType: "race",
+      entityKey: race.clientKey,
+      expectedVersion: 1,
+      remoteVersion: 1,
+      baseSnapshot: { ...race, name: "cloud" },
+      localSnapshot: race,
+      remoteSnapshot: { ...race, name: "cloud" },
+      reconciliation: "conflict",
+      fields: [],
+      status: "unresolved",
+      createdAt: "2026-07-26T01:00:00.000Z",
+    };
+    await replaceWorkspace(database, { ...snapshot, races: [race] }, [held]);
+    await putConflict(database, conflict);
+
+    const result = await settleHeldRebaseConflict(database, {
+      ownerScope: OWNER,
+      mutationId: held.mutationId,
+      entityKey: held.entityKey,
+      cloudId: "cloud-race",
+      cloudVersion: 1,
+      settledAt: "2026-07-26T01:01:00.000Z",
+    });
+
+    expect(result).toMatchObject({
+      mutation: {
+        mutationId: "held-mutation",
+        status: "pending",
+        deliveryPolicy: "manual-review",
+      },
+      resolvedConflictCount: 1,
+    });
+    expect(await listConflicts(database, OWNER)).toMatchObject([
+      { status: "resolved", resolution: "superseded" },
+    ]);
+  });
+
+  it("retains an applied rebase as terminal audit history after cloud evidence", async () => {
+    const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
+    const snapshot = workspace(OWNER, "applied-rebase");
+    const race = {
+      ...snapshot.races[0]!,
+      dataScope: "test" as const,
+      cloudId: "cloud-race",
+      syncVersion: 2,
+    };
+    const rebase = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: race.clientKey,
+        payload: { ...race, syncVersion: 1 },
+        expectedVersion: 1,
+        deliveryPolicy: "manual-review",
+        rebase: {
+          kind: "verified-receipt",
+          receiptMutationId: "base-receipt",
+          cloudId: "cloud-race",
+          cloudVersion: 1,
+          reason: "verified rebase",
+        },
+      },
+      { randomUUID: () => "applied-rebase-mutation" },
+    );
+    await replaceWorkspace(database, { ...snapshot, races: [race] }, [rebase]);
+
+    const result = await commitAppliedRebase(database, {
+      workspace: { ...snapshot, races: [race] },
+      mutationId: rebase.mutationId,
+      entityKey: race.clientKey,
+      cloudId: "cloud-race",
+      expectedVersion: 1,
+      resultingVersion: 2,
+      receiptMutationId: rebase.mutationId,
+      changeSequence: 42,
+      completedAt: "2026-07-26T02:00:00.000Z",
+    });
+
+    expect(result.mutation).toMatchObject({
+      mutationId: "applied-rebase-mutation",
+      status: "applied_audited",
+      audit: {
+        status: "applied_audited",
+        cloudVersion: 2,
+        receiptMutationId: "applied-rebase-mutation",
+        changeSequence: 42,
+      },
+    });
+    expect(await listOutbox(database, OWNER)).toHaveLength(1);
+    expect((await getWorkspace(database, OWNER))?.races[0]).toMatchObject({
+      cloudId: "cloud-race",
+      syncVersion: 2,
+    });
+  });
+
+  it("does not complete a rebase when receipt identity is missing", async () => {
+    const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
+    const snapshot = workspace(OWNER, "missing-receipt");
+    const race = {
+      ...snapshot.races[0]!,
+      dataScope: "test" as const,
+      cloudId: "cloud-race",
+      syncVersion: 2,
+    };
+    const rebase = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: race.clientKey,
+        payload: { ...race, syncVersion: 1 },
+        expectedVersion: 1,
+        deliveryPolicy: "manual-review",
+        rebase: {
+          kind: "verified-receipt",
+          receiptMutationId: "base-receipt",
+          cloudId: "cloud-race",
+          cloudVersion: 1,
+          reason: "verified rebase",
+        },
+      },
+      { randomUUID: () => "pending-rebase" },
+    );
+    await replaceWorkspace(database, { ...snapshot, races: [race] }, [rebase]);
+
+    await expect(commitAppliedRebase(database, {
+      workspace: { ...snapshot, races: [race] },
+      mutationId: rebase.mutationId,
+      entityKey: race.clientKey,
+      cloudId: "cloud-race",
+      expectedVersion: 1,
+      resultingVersion: 2,
+      receiptMutationId: "different-receipt",
+      changeSequence: 42,
+      completedAt: "2026-07-26T02:00:00.000Z",
+    })).rejects.toThrow("incomplete");
+    expect(await listOutbox(database, OWNER)).toEqual([rebase]);
+  });
+
+  it("exports an exact safety backup without changing Outbox state", async () => {
+    const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
+    const snapshot = workspace(OWNER, "backup");
+    const mutation = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: snapshot.races[0]!.clientKey,
+        payload: snapshot.races[0],
+        expectedVersion: 0,
+      },
+      { randomUUID: () => "backup-mutation" },
+    );
+    await replaceWorkspace(database, snapshot, [mutation]);
+
+    const backup = await exportSyncSafetyBackup(
+      database,
+      OWNER,
+      new Date("2026-07-26T00:00:00.000Z"),
+    );
+
+    expect(backup).toMatchObject({
+      format: "UMA_NOTE_OUTBOX_SAFETY_BACKUP_V1",
+      createdAt: "2026-07-26T00:00:00.000Z",
+      ownerScope: OWNER,
+      workspace: snapshot,
+      outbox: [mutation],
+    });
+    expect(await listOutbox(database, OWNER)).toEqual([mutation]);
+  });
+
+  it("atomically stores cloud metadata and a successor before retiring the original", async () => {
+    const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
+    const originalWorkspace = workspace(OWNER, "atomic-recovery");
+    const original = {
+      ...createOutboxMutation(
+        {
+          ownerScope: OWNER,
+          entityType: "race",
+          entityKey: originalWorkspace.races[0]!.clientKey,
+          payload: originalWorkspace.races[0],
+          expectedVersion: 0,
+        },
+        { randomUUID: () => "original-recovery" },
+      ),
+      status: "conflict" as const,
+    };
+    await replaceWorkspace(database, originalWorkspace, [original]);
+    const successor = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: original.entityKey,
+        payload: {
+          ...originalWorkspace.races[0]!,
+          cloudId: "cloud-race-id",
+          syncVersion: 4,
+          name: "after",
+        },
+        baseSnapshot: originalWorkspace.races[0],
+        expectedVersion: 4,
+        predecessorMutationId: original.mutationId,
+      },
+      { randomUUID: () => "successor-recovery" },
+    );
+    const nextWorkspace: WorkspaceSnapshot = {
+      ...originalWorkspace,
+      races: [successor.payload!],
+      settings: {
+        cloudSync: {
+          versions: { [`race:${original.entityKey}`]: 4 },
+          cloudIds: { [`race:${original.entityKey}`]: "cloud-race-id" },
+        },
+      },
+    };
+
+    const result = await commitSyncResolution(database, {
+      workspace: nextWorkspace,
+      originalMutationId: original.mutationId,
+      entityType: "race",
+      entityKey: original.entityKey,
+      successor,
+    });
+
+    expect(result).toEqual({ successor, originalRemoved: true });
+    expect(await getWorkspace(database, OWNER)).toEqual(nextWorkspace);
+    expect(await listOutbox(database, OWNER)).toEqual([successor]);
+  });
+
+  it("leaves the original intact when a successor is not safely linked", async () => {
+    const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
+    const snapshot = workspace(OWNER, "rollback");
+    const original = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: snapshot.races[0]!.clientKey,
+        payload: snapshot.races[0],
+        expectedVersion: 0,
+      },
+      { randomUUID: () => "rollback-original" },
+    );
+    await replaceWorkspace(database, snapshot, [original]);
+    const invalid = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: original.entityKey,
+        payload: { ...snapshot.races[0]!, name: "invalid" },
+        expectedVersion: 1,
+        predecessorMutationId: "different-original",
+      },
+      { randomUUID: () => "rollback-successor" },
+    );
+
+    await expect(
+      commitSyncResolution(database, {
+        workspace: { ...snapshot, updatedAt: "2026-07-26T01:00:00.000Z" },
+        originalMutationId: original.mutationId,
+        entityType: "race",
+        entityKey: original.entityKey,
+        successor: invalid,
+      }),
+    ).rejects.toThrow("safely linked");
+    expect(await getWorkspace(database, OWNER)).toEqual(snapshot);
+    expect(await listOutbox(database, OWNER)).toEqual([original]);
+  });
+
+  it("replaces one linked successor without touching older unlinked Outbox entries", async () => {
+    const database = await openLocalDatabase({ indexedDB: null, localStorage: null });
+    const snapshot = workspace(OWNER, "replacement");
+    const oldFailed = {
+      ...createOutboxMutation(
+        {
+          ownerScope: OWNER,
+          entityType: "race",
+          entityKey: snapshot.races[0]!.clientKey,
+          payload: { ...snapshot.races[0]!, name: "old failed" },
+          expectedVersion: 0,
+        },
+        { randomUUID: () => "old-failed" },
+      ),
+      status: "failed" as const,
+    };
+    const original = {
+      ...createOutboxMutation(
+        {
+          ownerScope: OWNER,
+          entityType: "race",
+          entityKey: snapshot.races[0]!.clientKey,
+          payload: { ...snapshot.races[0]!, name: "conflicted" },
+          expectedVersion: 0,
+        },
+        { randomUUID: () => "conflicted-original" },
+      ),
+      status: "conflict" as const,
+    };
+    const earlierSuccessor = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: original.entityKey,
+        payload: { ...snapshot.races[0]!, name: "local choice" },
+        expectedVersion: 1,
+        predecessorMutationId: "previous-original",
+      },
+      { randomUUID: () => "earlier-successor" },
+    );
+    await replaceWorkspace(
+      database,
+      snapshot,
+      [oldFailed, original, earlierSuccessor],
+    );
+    const replacement = createOutboxMutation(
+      {
+        ownerScope: OWNER,
+        entityType: "race",
+        entityKey: original.entityKey,
+        payload: { ...snapshot.races[0]!, name: "local choice" },
+        expectedVersion: 1,
+        predecessorMutationId: original.mutationId,
+      },
+      { randomUUID: () => "replacement-successor" },
+    );
+
+    await commitSyncResolution(database, {
+      workspace: snapshot,
+      originalMutationId: original.mutationId,
+      entityType: "race",
+      entityKey: original.entityKey,
+      successor: replacement,
+      supersededMutationIds: [earlierSuccessor.mutationId],
+    });
+
+    expect((await listOutbox(database, OWNER)).map((item) => item.mutationId))
+      .toEqual(["old-failed", "replacement-successor"]);
+  });
   it("migrates localStorage v1 without deleting its recoverable backup", async () => {
     const storage = new MemoryStorage();
     const legacyRace = createDemoRace();

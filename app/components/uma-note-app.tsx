@@ -58,6 +58,7 @@ import {
   type SyncBootstrap,
 } from "@/lib/supabase/sync-repository";
 import { applyTrustedLocalMigration } from "@/lib/supabase/migration-repository";
+import { loadRaceSyncEnvelopeByClientKey } from "@/lib/supabase/race-repository";
 import {
   lockRacePrediction,
   upgradeLegacyPredictionLocks,
@@ -70,7 +71,9 @@ import {
 } from "@/lib/race-scope";
 import {
   LEGACY_OWNER_SCOPE,
+  commitSyncResolution,
   enqueueMutation,
+  exportSyncSafetyBackup,
   getWorkspace,
   listConflicts,
   listOutbox,
@@ -84,17 +87,20 @@ import {
 import {
   createMutationId,
   createOutboxMutation,
+  isOutboxMutationActionable,
   ownerScopeForUser,
 } from "@/lib/sync/outbox";
 import { createSyncCoordinator, type SyncCoordinator } from "@/lib/sync/coordinator";
 import { pushOutboxMutation } from "@/lib/sync/supabase-adapter";
 import { createSyncConflict } from "@/lib/sync/reconciler";
+import { prepareRaceConflictResolution } from "@/lib/sync/race-recovery";
 import type {
   AuthState as SyncAuthState,
   OutboxMutation,
   OwnerScope,
   SyncConflict,
   SyncCoordinatorStatus,
+  WorkspaceSnapshot,
 } from "@/lib/sync/types";
 import {
   assertNoDuplicateRaces,
@@ -603,7 +609,7 @@ export function UmaNoteApp() {
     ) {
       return false;
     }
-    setPendingSyncCount(outbox.length);
+    setPendingSyncCount(outbox.filter(isOutboxMutationActionable).length);
     setSyncConflicts(conflicts.filter((conflict) => conflict.status === "unresolved"));
     return true;
   }, []);
@@ -1239,7 +1245,8 @@ export function UmaNoteApp() {
       }
     }
 
-    const pending = await listOutbox(database, ownerScope);
+    const pending = (await listOutbox(database, ownerScope))
+      .filter(isOutboxMutationActionable);
     assertCurrentCloudOperation();
     const pendingByEntity = new Map(
       pending.map((mutation) => [
@@ -1315,6 +1322,26 @@ export function UmaNoteApp() {
       );
       const pendingMutation = pendingByEntity.get(key);
       if (localMatchesRemote) {
+        nextCloudVersions.set(key, remote.version);
+        nextCloudBases.set(key, remote.value);
+        continue;
+      }
+      if (
+        pendingMutation?.deliveryPolicy === "manual-review" &&
+        pendingMutation.rebase?.kind === "verified-receipt" &&
+        pendingMutation.rebase.cloudId === remote.cloudId &&
+        pendingMutation.rebase.cloudVersion === remote.version &&
+        pendingMutation.expectedVersion === remote.version &&
+        pendingMutation.payload !== null &&
+        isRaceRecordArray([pendingMutation.payload]) &&
+        sameJson(
+          migrationSemanticProjection(localForSync),
+          migrationSemanticProjection(pendingMutation.payload as RaceRecord),
+        )
+      ) {
+        // A verified rebase intentionally preserves a local-only difference.
+        // Pull may refresh its cloud base/version, but must not turn the held
+        // mutation into another conflict or transmit it automatically.
         nextCloudVersions.set(key, remote.version);
         nextCloudBases.set(key, remote.value);
         continue;
@@ -1813,42 +1840,122 @@ export function UmaNoteApp() {
     await refreshSyncState(conflict.ownerScope);
   }, [assertConflictOwnerCurrent, refreshSyncState]);
 
+  const applyResolvedRaceWorkspace = useCallback((
+    workspace: WorkspaceSnapshot,
+    entityKey: string,
+  ) => {
+    racesRef.current = workspace.races;
+    setRaces(workspace.races);
+    const activeRaceId = workspace.races.some(
+      (race) => race.id === activeRaceIdRef.current,
+    )
+      ? activeRaceIdRef.current
+      : (workspace.races[0]?.id ?? "");
+    activeRaceIdRef.current = activeRaceId;
+    setActiveRaceId(activeRaceId);
+
+    const rawCloudSync = workspace.settings.cloudSync;
+    const cloudSync =
+      rawCloudSync !== null && typeof rawCloudSync === "object"
+        ? rawCloudSync as Record<string, unknown>
+        : {};
+    const versions =
+      cloudSync.versions !== null && typeof cloudSync.versions === "object"
+        ? cloudSync.versions as Record<string, unknown>
+        : {};
+    const bases =
+      cloudSync.bases !== null && typeof cloudSync.bases === "object"
+        ? cloudSync.bases as Record<string, unknown>
+        : {};
+    const key = syncEntityKey("race", entityKey);
+    const version = versions[key];
+    if (typeof version === "number" && Number.isFinite(version)) {
+      cloudVersionsRef.current.set(key, version);
+    }
+    if (Object.hasOwn(bases, key)) {
+      cloudBaseSnapshotsRef.current.set(key, bases[key]);
+    }
+    const local = workspace.races.find(
+      (race) => race.clientKey === entityKey,
+    );
+    if (local && local.id !== entityKey) {
+      cloudRaceAliasesRef.current.set(local.id, entityKey);
+    }
+  }, []);
+
   const useCloudConflictVersion = useCallback(async () => {
     const conflict = syncConflicts[0];
     if (!conflict) return;
     assertConflictOwnerCurrent(conflict);
     const database = localDatabaseRef.current;
     if (!database) return;
+    if (conflict.entityType === "race") {
+      const [workspace, pending, cloudEnvelope] = await Promise.all([
+        getWorkspace(database, conflict.ownerScope),
+        listOutbox(database, conflict.ownerScope),
+        loadRaceSyncEnvelopeByClientKey(
+          getSupabaseClient(),
+          conflict.entityKey,
+        ),
+      ]);
+      assertConflictOwnerCurrent(conflict);
+      if (!workspace || !cloudEnvelope) {
+        throw new Error("競合解決に必要なレースを確認できないため安全に停止しました。");
+      }
+      const original = pending.find(
+        (mutation) => mutation.mutationId === conflict.mutationId,
+      );
+      if (!original) {
+        throw new Error("元のOutboxが見つからないため安全に停止しました。");
+      }
+      const prepared = prepareRaceConflictResolution({
+        workspace,
+        original,
+        conflict,
+        cloud: {
+          cloudId: cloudEnvelope.cloudId,
+          clientKey: cloudEnvelope.clientKey,
+          version: cloudEnvelope.version,
+          race: cloudEnvelope.race,
+        },
+        choice: "cloud",
+      });
+      const supersededMutationIds = pending
+        .filter((mutation) => {
+          const payload =
+            mutation.payload !== null && typeof mutation.payload === "object"
+              ? mutation.payload as Partial<RaceRecord>
+              : null;
+          return (
+            mutation.mutationId !== original.mutationId &&
+            Boolean(mutation.predecessorMutationId) &&
+            mutation.entityType === "race" &&
+            mutation.entityKey === original.entityKey &&
+            mutation.expectedVersion === cloudEnvelope.version &&
+            payload?.name === (original.payload as RaceRecord).name
+          );
+        })
+        .map((mutation) => mutation.mutationId);
+      await commitSyncResolution(database, {
+        workspace: prepared.workspace,
+        originalMutationId: original.mutationId,
+        entityType: "race",
+        entityKey: original.entityKey,
+        supersededMutationIds,
+        resolvedConflict: prepared.resolvedConflict,
+      });
+      assertConflictOwnerCurrent(conflict);
+      applyResolvedRaceWorkspace(prepared.workspace, original.entityKey);
+      await refreshSyncState(conflict.ownerScope);
+      setToast("クラウドのレース名と同期情報を採用しました。");
+      return;
+    }
     const remote = conflict.remoteSnapshot;
-    let nextRaces = [...racesRef.current];
+    const nextRaces = [...racesRef.current];
     let nextRules = [...rulesRef.current];
     let nextSettings = settingsRef.current;
-    let nextActiveRaceId = activeRaceIdRef.current;
-    if (conflict.entityType === "race") {
-      const localId = [...cloudRaceAliasesRef.current.entries()].find(
-        ([, cloudId]) => cloudId === conflict.entityKey,
-      )?.[0] ?? conflict.entityKey;
-      if (remote === null) {
-        nextRaces = nextRaces.filter((race) => race.id !== localId);
-        if (nextActiveRaceId === localId) nextActiveRaceId = nextRaces[0]?.id ?? "";
-      } else if (isRaceRecordArray([remote])) {
-        const remoteRace = remote as RaceRecord;
-        const found = nextRaces.some((race) => race.id === localId);
-        const adoptedRace = found
-          ? { ...remoteRace, id: localId, clientKey: conflict.entityKey }
-          : { ...remoteRace, clientKey: conflict.entityKey };
-        nextRaces = found
-          ? nextRaces.map((race) => race.id === localId ? adoptedRace : race)
-          : [adoptedRace, ...nextRaces];
-        cloudRaceAliasesRef.current.delete(localId);
-      } else {
-        throw new Error("クラウド側のレースデータを検証できませんでした。");
-      }
-      dirtyRaceIdsRef.current.delete(localId);
-      if (conflict.ownerScope === LEGACY_OWNER_SCOPE) {
-        persistDirtyIds(LOCAL_DIRTY_RACES_KEY, dirtyRaceIdsRef.current);
-      }
-    } else if (conflict.entityType === "rule") {
+    const nextActiveRaceId = activeRaceIdRef.current;
+    if (conflict.entityType === "rule") {
       const localId = [...cloudRuleAliasesRef.current.entries()].find(
         ([, cloudId]) => cloudId === conflict.entityKey,
       )?.[0] ?? conflict.entityKey;
@@ -1921,7 +2028,13 @@ export function UmaNoteApp() {
     });
     await markConflictResolved(conflict, "remote");
     setToast("クラウド版を採用しました");
-  }, [assertConflictOwnerCurrent, markConflictResolved, syncConflicts]);
+  }, [
+    applyResolvedRaceWorkspace,
+    assertConflictOwnerCurrent,
+    markConflictResolved,
+    refreshSyncState,
+    syncConflicts,
+  ]);
 
   const resendLocalConflictVersion = useCallback(async () => {
     const conflict = syncConflicts[0];
@@ -1929,6 +2042,71 @@ export function UmaNoteApp() {
     assertConflictOwnerCurrent(conflict);
     const database = localDatabaseRef.current;
     if (!database) return;
+    if (conflict.entityType === "race") {
+      const [workspace, pending, cloudEnvelope] = await Promise.all([
+        getWorkspace(database, conflict.ownerScope),
+        listOutbox(database, conflict.ownerScope),
+        loadRaceSyncEnvelopeByClientKey(
+          getSupabaseClient(),
+          conflict.entityKey,
+        ),
+      ]);
+      assertConflictOwnerCurrent(conflict);
+      if (!workspace || !cloudEnvelope) {
+        throw new Error("競合解決に必要なレースを確認できないため安全に停止しました。");
+      }
+      const original = pending.find(
+        (mutation) => mutation.mutationId === conflict.mutationId,
+      );
+      if (!original) {
+        throw new Error("元のOutboxが見つからないため安全に停止しました。");
+      }
+      const prepared = prepareRaceConflictResolution({
+        workspace,
+        original,
+        conflict,
+        cloud: {
+          cloudId: cloudEnvelope.cloudId,
+          clientKey: cloudEnvelope.clientKey,
+          version: cloudEnvelope.version,
+          race: cloudEnvelope.race,
+        },
+        choice: "local",
+      });
+      if (!prepared.successor) {
+        throw new Error("後続mutationを作成できないため安全に停止しました。");
+      }
+      const supersededMutationIds = pending
+        .filter((mutation) => {
+          const payload =
+            mutation.payload !== null && typeof mutation.payload === "object"
+              ? mutation.payload as Partial<RaceRecord>
+              : null;
+          return (
+            mutation.mutationId !== original.mutationId &&
+            Boolean(mutation.predecessorMutationId) &&
+            mutation.entityType === "race" &&
+            mutation.entityKey === original.entityKey &&
+            mutation.expectedVersion === cloudEnvelope.version &&
+            payload?.name === (original.payload as RaceRecord).name
+          );
+        })
+        .map((mutation) => mutation.mutationId);
+      await commitSyncResolution(database, {
+        workspace: prepared.workspace,
+        originalMutationId: original.mutationId,
+        entityType: "race",
+        entityKey: original.entityKey,
+        successor: prepared.successor,
+        supersededMutationIds,
+        resolvedConflict: prepared.resolvedConflict,
+      });
+      assertConflictOwnerCurrent(conflict);
+      applyResolvedRaceWorkspace(prepared.workspace, original.entityKey);
+      await refreshSyncState(conflict.ownerScope);
+      setToast("端末のレース名を維持し、後続mutationを作成しました。");
+      return;
+    }
     const successor = createOutboxMutation({
       ownerScope: conflict.ownerScope,
       entityType: conflict.entityType,
@@ -1942,9 +2120,36 @@ export function UmaNoteApp() {
     });
     await markConflictResolved(conflict, "local", successor);
     await refreshSyncState(conflict.ownerScope);
-    await syncCoordinatorRef.current?.flush("manual");
-    setToast("端末版を明示的に再送しました");
-  }, [assertConflictOwnerCurrent, markConflictResolved, refreshSyncState, syncConflicts]);
+    setToast("端末版を維持し、後続mutationを作成しました。");
+  }, [
+    applyResolvedRaceWorkspace,
+    assertConflictOwnerCurrent,
+    markConflictResolved,
+    refreshSyncState,
+    syncConflicts,
+  ]);
+
+  const backupCurrentConflict = useCallback(async () => {
+    const database = localDatabaseRef.current;
+    const conflict = syncConflicts[0];
+    if (!database || !conflict) return;
+    assertConflictOwnerCurrent(conflict);
+    const backup = await exportSyncSafetyBackup(
+      database,
+      conflict.ownerScope,
+    );
+    const blob = new Blob([JSON.stringify(backup, null, 2)], {
+      type: "application/json;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    const timestamp = backup.createdAt.replaceAll(":", "-");
+    anchor.href = url;
+    anchor.download = `uma-note-outbox-safety-${timestamp}.uma-note.json`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    setToast(`Outbox原本 ${backup.outbox.length}件をバックアップしました。`);
+  }, [assertConflictOwnerCurrent, syncConflicts]);
 
   const exportCurrentConflict = useCallback(() => {
     const conflict = syncConflicts[0];
@@ -2212,6 +2417,7 @@ export function UmaNoteApp() {
         conflict={syncConflicts[0] ?? null}
         onUseCloud={useCloudConflictVersion}
         onUseLocal={resendLocalConflictVersion}
+        onBackup={backupCurrentConflict}
         onExport={exportCurrentConflict}
       />
     </div>
