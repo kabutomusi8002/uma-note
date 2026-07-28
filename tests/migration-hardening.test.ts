@@ -16,13 +16,17 @@ const expectedIntegrationTestFiles = [
   "0007_race_client_key_insert_fix_test.sql",
 ] as const;
 
+function readNormalizedText(url: URL): string {
+  return readFileSync(url, "utf8").replace(/\r\n?/g, "\n");
+}
+
 const migrationFiles = readdirSync(migrationDirectory)
   .filter((name) => /^\d{4}_.+\.sql$/.test(name))
   .sort();
 const migrations = new Map(
   migrationFiles.map((name) => [
     name,
-    readFileSync(new URL(name, migrationDirectory), "utf8"),
+    readNormalizedText(new URL(name, migrationDirectory)),
   ]),
 );
 const hardening = migrations.get("0006_pre_remote_hardening.sql") ?? "";
@@ -35,7 +39,7 @@ const integrationTestDirectory = new URL(
 const integrationTests = new Map(
   expectedIntegrationTestFiles.map((name) => [
     name,
-    readFileSync(new URL(name, integrationTestDirectory), "utf8"),
+    readNormalizedText(new URL(name, integrationTestDirectory)),
   ]),
 );
 const raceClientKeyIntegrationTest =
