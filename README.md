@@ -178,6 +178,15 @@ Supabase AuthenticationのURL Configurationで、以下を登録します。
 - testユーザー／test行は、診断run識別子、作成日、所有者区分、`data_scope=test`を基準に管理し、live集計と明確に分離します。
 - 整理する場合は各所有者の認証済み権限で自分のtest行だけを対象にします。所有者未確定行を管理者権限で探索・変更せず、service_roleによる一括操作は通常運用では行いません。
 
+#### 期限付き依存リスク記録（再確認期限: 2026-08-04）
+
+- Next.js本体と`eslint-config-next`は16.2.12へ更新済みです。
+- Next.js経由のPostCSSとSharpについては、npm auditのHigh警告が残る可能性があります。これは警告を無視してよいという意味ではなく、期限付きで到達性と互換性を管理する記録です。
+- 現在のVinext production bundleには該当するNext.js／PostCSS／Sharpのruntime経路がありません。ユーザー入力CSSをPostCSSで処理せず、ユーザー提供画像をSharpへ渡しません。
+- `next/image`、Server Actions、middleware認証、ユーザー入力を外部ホスト名へ組み込む動的rewritesを使用しません。
+- インターネット公開前に依存ツリーとproduction auditを再監査し、警告を解消します。前項の機能を新たに追加した場合は、このリスク受容を直ちに無効化して公開を停止します。
+- Sharpの強制overrideは、Vinext、Next.js、Cloudflare／Miniflareの画像経路との互換性を確認せずに行いません。
+
 ### セキュリティ
 
 - 共有マスター以外の全ユーザーデータ行に `user_id` を保持
