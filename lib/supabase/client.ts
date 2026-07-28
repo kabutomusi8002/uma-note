@@ -1,31 +1,46 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-let browserClient: SupabaseClient | null = null;
+type SupabaseClientGlobal = typeof globalThis & {
+  __umaNoteSupabaseClient?: SupabaseClient;
+};
+
+function publicKey(): string | undefined {
+  return (
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ??
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  );
+}
 
 export function isSupabaseConfigured(): boolean {
   return Boolean(
     process.env.NEXT_PUBLIC_SUPABASE_URL &&
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+      publicKey(),
   );
 }
 
 export function getSupabaseClient(): SupabaseClient {
-  if (browserClient) return browserClient;
+  const runtime = globalThis as SupabaseClientGlobal;
+  if (runtime.__umaNoteSupabaseClient) {
+    return runtime.__umaNoteSupabaseClient;
+  }
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  if (!url || !anonKey) {
+  const key = publicKey();
+  if (!url || !key) {
     throw new Error(
-      "Supabase接続が未設定です。.env.local に NEXT_PUBLIC_SUPABASE_URL と NEXT_PUBLIC_SUPABASE_ANON_KEY を設定してください。",
+      "Supabase接続が未設定です。.env.local に NEXT_PUBLIC_SUPABASE_URL と NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY を設定してください。",
     );
   }
 
-  browserClient = createClient(url, anonKey, {
+  runtime.__umaNoteSupabaseClient = createClient(url, key, {
     auth: {
       persistSession: true,
       autoRefreshToken: true,
-      detectSessionInUrl: true,
+      // PKCE is completed explicitly by /auth/callback. Automatic detection
+      // would race with exchangeCodeForSession and can consume the code twice.
+      detectSessionInUrl: false,
+      flowType: "pkce",
     },
   });
-  return browserClient;
+  return runtime.__umaNoteSupabaseClient;
 }

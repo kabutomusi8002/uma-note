@@ -111,6 +111,13 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  // Authentication callbacks carry a one-time PKCE code. Keep them
+  // network-only and never replace the cached public app shell with this page.
+  if (request.mode === "navigate" && url.pathname === "/auth/callback") {
+    event.respondWith(fetch(request, { cache: "no-store" }));
+    return;
+  }
+
   // The server-rendered document is a public app shell. User records live in
   // localStorage/Supabase and are not embedded in this cached response.
   if (request.mode === "navigate") {

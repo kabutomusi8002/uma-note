@@ -1,10 +1,14 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { expandBetCombinations } from "@/lib/calculations";
+import { raceClientKey } from "@/lib/race-identity";
+import { repositoryError } from "@/lib/supabase/repository-error";
 import { RACE_DATA_SCOPES } from "@/lib/types";
 import type {
   BetPlan,
   BetType,
+  PredictionLockedSnapshot,
   PredictionMark,
+  PredictionRuleVersion,
   RacePrediction,
   RaceDataScope,
   RaceRecord,
@@ -98,6 +102,16 @@ function dataScopeValue(value: unknown): RaceDataScope {
   return RACE_DATA_SCOPES.includes(candidate) ? candidate : "live";
 }
 
+function startTimeInJapan(startsAt: string, fallback = "00:00"): string {
+  if (!startsAt || !Number.isFinite(Date.parse(startsAt))) return fallback;
+  return new Intl.DateTimeFormat("ja-JP", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "Asia/Tokyo",
+  }).format(new Date(startsAt));
+}
+
 function predictionSnapshot(
   value: unknown,
   fallback: RacePrediction,
@@ -177,6 +191,140 @@ function slipToPlan(raw: unknown): BetPlan | null {
   };
 }
 
+function ruleVersionFromSnapshot(
+  rawSnapshot: unknown,
+  rawPrediction: unknown,
+  rawRace: unknown,
+): PredictionRuleVersion | null {
+  const ruleSnapshot = object(rawSnapshot);
+  const prediction = object(rawPrediction);
+  const race = object(rawRace);
+  const ruleParameters = object(ruleSnapshot.parameters);
+  if (
+    !(
+      (typeof ruleSnapshot.version === "string" &&
+        typeof ruleSnapshot.name === "string") ||
+      typeof ruleSnapshot.rule_set_name === "string" ||
+      typeof ruleParameters.semantic_version === "string"
+    )
+  ) {
+    return null;
+  }
+  const storedRules = array(ruleParameters.rules ?? ruleSnapshot.rules).filter(
+    (item): item is string => typeof item === "string",
+  );
+  return {
+    id: text(
+      prediction.rule_version_id,
+      text(
+        ruleSnapshot.id,
+        `snapshot-${text(
+          ruleParameters.semantic_version,
+          text(ruleSnapshot.version, String(ruleSnapshot.version_number ?? "1")),
+        )}`,
+      ),
+    ),
+    name: text(
+      ruleParameters.display_name,
+      text(ruleSnapshot.name, text(ruleSnapshot.rule_set_name)),
+    ),
+    version: text(
+      ruleParameters.semantic_version,
+      text(ruleSnapshot.version, String(ruleSnapshot.version_number ?? "1")),
+    ),
+    rules: storedRules.length
+      ? storedRules
+      : text(ruleSnapshot.content)
+          .split("\n")
+          .map((item) => item.trim())
+          .filter(Boolean),
+    createdAt: text(
+      ruleSnapshot.createdAt,
+      text(
+        ruleSnapshot.published_at,
+        text(prediction.created_at, text(race.created_at, new Date().toISOString())),
+      ),
+    ),
+    note: text(ruleSnapshot.note, text(ruleSnapshot.change_note)) || undefined,
+    isActive: booleanValue(ruleSnapshot.isActive ?? ruleSnapshot.is_active),
+  };
+}
+
+function lockedSnapshotFromDatabase(
+  raw: unknown,
+  context: {
+    clientRaceId: string;
+    dataScope: RaceDataScope;
+    lockedAt: string;
+  },
+): PredictionLockedSnapshot | undefined {
+  const snapshot = object(raw);
+  if (numberValue(snapshot.schemaVersion) === 1) {
+    const clientSnapshot = snapshot as unknown as PredictionLockedSnapshot;
+    return typeof clientSnapshot.lockedAt === "string" ? clientSnapshot : undefined;
+  }
+  if (numberValue(snapshot.schema_version) !== 1) return undefined;
+
+  const race = object(snapshot.race);
+  const racecourse = object(race.racecourse);
+  const prediction = object(snapshot.prediction);
+  const selections = array(snapshot.horse_selections).map(object);
+  const startsAt = text(race.starts_at);
+  const storedDataScope = text(race.data_scope) as RaceDataScope;
+  const lockedDataScope = RACE_DATA_SCOPES.includes(storedDataScope)
+    ? storedDataScope
+    : context.dataScope;
+  const selectedHorses = selections
+    .filter((selection) => MARK_FROM_DATABASE[text(selection.mark)])
+    .map((selection) => ({
+      horseNumber: numberValue(selection.horse_number),
+      horseName: text(selection.horse_name),
+      mark: MARK_FROM_DATABASE[text(selection.mark)],
+      comment: text(selection.evaluation) || undefined,
+    }));
+  const decision = text(prediction.decision);
+  const mappedPrediction: RacePrediction = {
+    selectedHorses,
+    paceScenario: text(prediction.pace_scenario),
+    trackView: text(prediction.track_bias, text(prediction.observed_going)),
+    dangerousFavorites: selections
+      .filter((selection) => booleanValue(selection.is_dangerous_favorite))
+      .map((selection) => numberValue(selection.horse_number)),
+    longshots: selections
+      .filter((selection) => booleanValue(selection.is_longshot))
+      .map((selection) => numberValue(selection.horse_number)),
+    decision:
+      decision === "pass"
+        ? "skip"
+        : decision === "buy"
+          ? "buy"
+          : "pending",
+    note: text(prediction.summary),
+  };
+  return {
+    schemaVersion: 1,
+    race: {
+      id: context.clientRaceId,
+      date: text(race.meeting_date, startsAt.slice(0, 10)),
+      course: text(racecourse.name_ja, text(racecourse.code)),
+      raceNumber: numberValue(race.race_number),
+      startTime: startTimeInJapan(startsAt),
+      name: text(race.name, "名称未設定レース"),
+      dataScope: lockedDataScope,
+    },
+    prediction: mappedPrediction,
+    proposedBets: array(snapshot.proposal_slips)
+      .map(slipToPlan)
+      .filter((plan): plan is BetPlan => plan !== null),
+    ruleVersion: ruleVersionFromSnapshot(
+      prediction.rule_snapshot,
+      prediction,
+      race,
+    ),
+    lockedAt: context.lockedAt,
+  };
+}
+
 function collectEntries(race: RaceRecord): JsonObject[] {
   const entries = new Map<number, string>();
   const add = (horseNumber: number, horseName?: string) => {
@@ -224,7 +372,7 @@ export function raceToDatabasePayload(race: RaceRecord): JsonObject {
   );
 
   return {
-    ...(UUID_PATTERN.test(race.id) ? { id: race.id } : {}),
+    client_key: raceClientKey(race),
     change_source: "uma_note_pwa",
     meeting: {
       meeting_date: race.date,
@@ -245,7 +393,7 @@ export function raceToDatabasePayload(race: RaceRecord): JsonObject {
         ? { rule_version_id: race.ruleVersion.id }
         : { rule_snapshot: race.ruleVersion ?? {} }),
       status:
-        race.lock.isLocked || race.lock.postTimeLockedAt ? "locked" : "draft",
+        race.lock.isLocked ? "locked" : "draft",
       pace: "unknown",
       pace_scenario: race.prediction.paceScenario,
       observed_going: "unknown",
@@ -258,6 +406,8 @@ export function raceToDatabasePayload(race: RaceRecord): JsonObject {
             : "buy",
       summary: race.prediction.note,
       locked_at: race.lock.lockedAt,
+      post_time_locked_at: race.lock.postTimeLockedAt ?? null,
+      locked_snapshot: race.lock.lockedSnapshot ?? null,
       revisions: race.lock.revisions.map((revision) => ({
         revision: revision.revision,
         changed_at: revision.changedAt,
@@ -328,25 +478,31 @@ export function databaseRecordToRace(raw: unknown): RaceRecord {
   const result = record.result ? object(record.result) : null;
   const reflection = record.reflection ? object(record.reflection) : null;
   const startsAt = text(race.starts_at);
-  const started = startsAt ? new Date(startsAt) : new Date();
   const date = text(meeting.meeting_date) || startsAt.slice(0, 10);
-  const startTime = startsAt
-    ? new Intl.DateTimeFormat("ja-JP", {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-        timeZone: "Asia/Tokyo",
-      }).format(started)
-    : "00:00";
+  const startTime = startTimeInJapan(startsAt);
   const slips = array(record.bet_slips).map(object);
   const ruleSnapshot = object(prediction.rule_snapshot);
-  const ruleParameters = object(ruleSnapshot.parameters);
   const raceStatusText = text(race.status);
   const raceStatus = (["scheduled", "closed", "resulted", "cancelled"] as const)
     .includes(raceStatusText as RaceStatus)
     ? (raceStatusText as RaceStatus)
     : undefined;
   const dataScope = dataScopeValue(race.data_scope ?? record.data_scope);
+  const clientRaceId = text(record.client_key, text(record.id));
+  const lockedAt = text(prediction.locked_at);
+  const mappedRuleVersion = ruleVersionFromSnapshot(
+    ruleSnapshot,
+    prediction,
+    race,
+  );
+  const lockedSnapshot = lockedSnapshotFromDatabase(
+    prediction.locked_snapshot,
+    {
+      clientRaceId,
+      dataScope,
+      lockedAt,
+    },
+  );
   const entries = array(record.entries)
     .map(object)
     .map((entry) => ({
@@ -380,7 +536,12 @@ export function databaseRecordToRace(raw: unknown): RaceRecord {
   };
 
   return {
-    id: text(record.id),
+    id: clientRaceId,
+    ...(text(record.id) ? { cloudId: text(record.id) } : {}),
+    ...(numberValue(record.sync_version) > 0
+      ? { syncVersion: numberValue(record.sync_version) }
+      : {}),
+    clientKey: clientRaceId,
     dataScope,
     ...(raceStatus ? { status: raceStatus } : {}),
     date,
@@ -399,14 +560,18 @@ export function databaseRecordToRace(raw: unknown): RaceRecord {
       .map(slipToPlan)
       .filter((plan): plan is BetPlan => plan !== null),
     lock: {
+      // effective_status also becomes locked automatically at post time. Keep
+      // that boundary distinct from an explicit immutable prediction lock.
       isLocked:
-        text(prediction.effective_status) === "locked" ||
-        text(prediction.status) === "locked",
-      lockedAt: text(prediction.locked_at) || null,
+        text(prediction.status) === "locked" || Boolean(lockedSnapshot),
+      lockedAt: lockedAt || null,
+      ...(lockedSnapshot ? { lockedSnapshot } : {}),
       ...(text(prediction.locked_at) &&
       text(prediction.effective_status) === "locked" &&
       text(prediction.status) !== "locked"
         ? { postTimeLockedAt: text(prediction.locked_at) }
+        : text(prediction.post_time_locked_at)
+          ? { postTimeLockedAt: text(prediction.post_time_locked_at) }
         : {}),
       revisions: array(prediction.revisions).map((item, index) => {
         const revision = object(item);
@@ -455,50 +620,7 @@ export function databaseRecordToRace(raw: unknown): RaceRecord {
           nextAction: text(reflection.next_action) || undefined,
         }
       : null,
-    ruleVersion:
-      (typeof ruleSnapshot.version === "string" &&
-        typeof ruleSnapshot.name === "string") ||
-      typeof ruleSnapshot.rule_set_name === "string"
-        ? {
-            id: text(
-              prediction.rule_version_id,
-              text(
-                ruleSnapshot.id,
-                `snapshot-${text(
-                  ruleParameters.semantic_version,
-                  text(ruleSnapshot.version, String(ruleSnapshot.version_number ?? "1")),
-                )}`,
-              ),
-            ),
-            name: text(
-              ruleParameters.display_name,
-              text(ruleSnapshot.name, text(ruleSnapshot.rule_set_name)),
-            ),
-            version: text(
-              ruleParameters.semantic_version,
-              text(ruleSnapshot.version, String(ruleSnapshot.version_number ?? "1")),
-            ),
-            rules: (() => {
-              const storedRules = array(
-                ruleParameters.rules ?? ruleSnapshot.rules,
-              ).filter((item): item is string => typeof item === "string");
-              if (storedRules.length) return storedRules;
-              return text(ruleSnapshot.content)
-                .split("\n")
-                .map((item) => item.trim())
-                .filter(Boolean);
-            })(),
-            createdAt: text(
-              ruleSnapshot.createdAt,
-              text(
-                ruleSnapshot.published_at,
-                text(race.created_at, new Date().toISOString()),
-              ),
-            ),
-            note: text(ruleSnapshot.note) || undefined,
-            isActive: booleanValue(ruleSnapshot.isActive),
-          }
-        : null,
+    ruleVersion: mappedRuleVersion,
     createdAt: text(race.created_at, new Date().toISOString()),
     updatedAt: text(race.updated_at, new Date().toISOString()),
   };
@@ -506,7 +628,7 @@ export function databaseRecordToRace(raw: unknown): RaceRecord {
 
 export async function loadRaceRecords(client: SupabaseClient): Promise<RaceRecord[]> {
   const { data, error } = await client.rpc("get_race_records");
-  if (error) throw new Error(`レースの読み込みに失敗しました: ${error.message}`);
+  if (error) throw repositoryError("レースの読み込みに失敗しました", error);
   const records = array(data).map(object);
   if (!records.length) return [];
 
@@ -518,7 +640,7 @@ export async function loadRaceRecords(client: SupabaseClient): Promise<RaceRecor
     .select("id,data_scope")
     .in("id", ids);
   if (scopeResult.error) {
-    throw new Error(`レース区分の読み込みに失敗しました: ${scopeResult.error.message}`);
+    throw repositoryError("レース区分の読み込みに失敗しました", scopeResult.error);
   }
   const scopeById = new Map(
     array(scopeResult.data).map((item) => {
@@ -532,22 +654,186 @@ export async function loadRaceRecords(client: SupabaseClient): Promise<RaceRecor
   }));
 }
 
-export async function saveRaceRecord(
+export interface RaceSyncEnvelope {
+  race: RaceRecord;
+  cloudId: string;
+  clientKey: string;
+  version: number;
+  changeSequence: number;
+}
+
+export async function loadRaceSyncEnvelopeByClientKey(
+  client: SupabaseClient,
+  clientKey: string,
+): Promise<RaceSyncEnvelope | null> {
+  const rows = await client
+    .from("races")
+    .select("id,client_key,sync_version")
+    .eq("client_key", clientKey)
+    .limit(2);
+  if (rows.error) {
+    throw repositoryError("クラウドレースの確認に失敗しました", rows.error);
+  }
+  if (!rows.data?.length) return null;
+  if (rows.data.length !== 1) {
+    throw new Error("同一clientKeyのクラウドレースが複数存在します");
+  }
+  const row = object(rows.data[0]);
+  const cloudId = text(row.id);
+  const record = await client.rpc("build_synced_race_record", {
+    p_race_id: cloudId,
+  });
+  if (record.error) {
+    throw repositoryError("クラウドレース内容の確認に失敗しました", record.error);
+  }
+  const envelope = syncEnvelope({
+    record: {
+      ...object(record.data),
+      id: cloudId,
+      client_key: text(row.client_key),
+      sync_version: numberValue(row.sync_version),
+    },
+    entity_id: cloudId,
+    client_key: text(row.client_key),
+    version: numberValue(row.sync_version),
+    change_seq: 0,
+  });
+  return envelope;
+}
+
+export async function findRaceMutationReceipt(
+  client: SupabaseClient,
+  input: { mutationId: string; clientKey: string },
+): Promise<{ cloudId: string; version: number } | null> {
+  const receipt = await client
+    .from("sync_mutation_receipts")
+    .select("entity_id,entity_client_key,resulting_version")
+    .eq("mutation_id", input.mutationId)
+    .eq("operation", "sync_race_record")
+    .limit(2);
+  if (receipt.error) {
+    throw repositoryError("mutation receiptの確認に失敗しました", receipt.error);
+  }
+  if (!receipt.data?.length) return null;
+  if (receipt.data.length !== 1) {
+    throw new Error("同一mutationのreceiptが複数存在します");
+  }
+  const row = object(receipt.data[0]);
+  if (text(row.entity_client_key) !== input.clientKey) {
+    throw new Error("receiptのclientKeyがOutboxと一致しません");
+  }
+  return {
+    cloudId: text(row.entity_id),
+    version: numberValue(row.resulting_version),
+  };
+}
+
+export type RaceSyncResult =
+  | ({ status: "applied" | "replayed" } & RaceSyncEnvelope)
+  | {
+      status: "conflict";
+      reason: string;
+      current: RaceSyncEnvelope | null;
+      currentVersion: number;
+    };
+
+function syncEnvelope(raw: unknown, fallbackClientKey = ""): RaceSyncEnvelope {
+  const response = object(raw);
+  const record = object(response.record ?? raw);
+  const race = databaseRecordToRace(record);
+  const raceRow = object(record.race);
+  const clientKey = text(
+    response.client_key,
+    text(record.client_key, fallbackClientKey || race.clientKey),
+  );
+  return {
+    race: {
+      ...race,
+      clientKey,
+    },
+    cloudId: text(response.entity_id, text(record.id)),
+    clientKey,
+    version: numberValue(
+      response.version,
+      numberValue(record.sync_version, numberValue(raceRow.sync_version, 0)),
+    ),
+    changeSequence: numberValue(response.change_seq, 0),
+  };
+}
+
+export async function syncRaceRecord(
   client: SupabaseClient,
   race: RaceRecord,
-): Promise<RaceRecord> {
-  const { data, error } = await client.rpc("upsert_race_record", {
-    payload: raceToDatabasePayload(race),
+  options: {
+    expectedVersion: number;
+    mutationId: string;
+    installationId: string;
+    signal?: AbortSignal;
+  },
+): Promise<RaceSyncResult> {
+  const request = client.rpc("sync_race_record", {
+    p_payload: raceToDatabasePayload(race),
+    p_expected_version: options.expectedVersion,
+    p_mutation_id: options.mutationId,
+    p_installation_id: options.installationId,
   });
-  if (error) throw new Error(`レースの保存に失敗しました: ${error.message}`);
-  const saved = databaseRecordToRace(data);
-  const dataScope = race.dataScope ?? "live";
-  const scopeResult = await client
-    .from("races")
-    .update({ data_scope: dataScope })
-    .eq("id", saved.id);
-  if (scopeResult.error) {
-    throw new Error(`レース区分の保存に失敗しました: ${scopeResult.error.message}`);
+  const { data, error } = await (
+    options.signal ? request.abortSignal(options.signal) : request
+  );
+  if (error) throw repositoryError("レース同期に失敗しました", error);
+  const response = object(data);
+  if (text(response.status) === "conflict") {
+    const current = response.current === null || response.current === undefined
+      ? null
+      : syncEnvelope(response.current, race.id);
+    return {
+      status: "conflict",
+      reason: text(response.reason, "クラウド側に別の変更があります。"),
+      current,
+      currentVersion: numberValue(response.current_version, current?.version ?? 0),
+    };
   }
-  return { ...saved, dataScope };
+  const status = text(response.status) === "replayed" ? "replayed" : "applied";
+  return {
+    status,
+    ...syncEnvelope(response, race.id),
+  };
+}
+
+export async function finalizePredictionLock(
+  client: SupabaseClient,
+  options: {
+    predictionId: string;
+    expectedRaceVersion: number;
+    mutationId: string;
+    installationId: string;
+    signal?: AbortSignal;
+  },
+): Promise<RaceSyncResult> {
+  const request = client.rpc("finalize_prediction_lock", {
+    p_prediction_id: options.predictionId,
+    p_expected_race_version: options.expectedRaceVersion,
+    p_mutation_id: options.mutationId,
+    p_installation_id: options.installationId,
+  });
+  const { data, error } = await (
+    options.signal ? request.abortSignal(options.signal) : request
+  );
+  if (error) throw repositoryError("予想ロックの同期に失敗しました", error);
+  const response = object(data);
+  if (text(response.status) === "conflict") {
+    const current = response.current === null || response.current === undefined
+      ? null
+      : syncEnvelope(response.current);
+    return {
+      status: "conflict",
+      reason: text(response.reason, "ロック前にクラウド側が変更されています。"),
+      current,
+      currentVersion: numberValue(response.current_version, current?.version ?? 0),
+    };
+  }
+  return {
+    status: text(response.status) === "replayed" ? "replayed" : "applied",
+    ...syncEnvelope(response),
+  };
 }

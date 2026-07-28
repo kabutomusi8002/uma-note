@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+/.npm-cache/
 /.pnpm-store/
 /.pnp
 .pnp.*
@@ -64,3 +65,4 @@ next-env.d.ts
 
 # device-local race backups
 /backups/*.race.txt
+/backups/*.uma-note.json

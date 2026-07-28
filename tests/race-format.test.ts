@@ -13,9 +13,11 @@ import {
   DEMO_RACE,
   DEMO_RACE_IDS,
   DEMO_RACES,
+  DEMO_UPCOMING_RACE,
   createDemoRace,
   createDemoRaces,
 } from "../lib/demo-data";
+import { lockRacePrediction } from "../lib/prediction-lock";
 import { normalizeKnownDemoRaceScopes } from "../lib/race-scope";
 
 describe("RACE/1 round trip", () => {
@@ -23,6 +25,7 @@ describe("RACE/1 round trip", () => {
     const exported = exportRace(DEMO_RACE);
 
     expect(exported).toMatch(/^---RACE---\nFORMAT_VERSION: 1/);
+    expect(exported).toContain(`CLIENT_KEY: "${DEMO_RACE.clientKey}"`);
     expect(exported).toContain('DATA_SCOPE: "demo"');
     expect(exported.endsWith(RACE_BLOCK_END)).toBe(true);
     expect(parseRace(exported)).toEqual(DEMO_RACE);
@@ -51,6 +54,7 @@ describe("RACE/1 round trip", () => {
       (dataScope, index) => ({
         ...createDemoRace(),
         id: `race-scope-${index + 1}`,
+        clientKey: `race-scope-${index + 1}`,
         dataScope,
       }),
     );
@@ -79,6 +83,36 @@ describe("RACE/1 round trip", () => {
     expect(parseRace(exported)).toEqual(race);
   });
 
+  it("独立した発走前ロックスナップショットを往復する", () => {
+    const locked = lockRacePrediction(structuredClone(DEMO_UPCOMING_RACE), {
+      revisionId: "backup-lock-revision",
+      changedAt: "2026-07-19T06:20:00.000Z",
+      lockedAt: "2026-07-19T06:20:01.000Z",
+    });
+
+    const restored = parseRace(exportRace(locked));
+    expect(restored.lock.lockedSnapshot).toEqual(
+      locked.lock.lockedSnapshot,
+    );
+    expect(restored.lock.lockedSnapshot?.proposedBets).toEqual(
+      locked.proposedBets,
+    );
+  });
+
+  it("keeps the lock-time scope when the current race scope changes", () => {
+    const locked = lockRacePrediction(structuredClone(DEMO_UPCOMING_RACE), {
+      revisionId: "scope-lock-revision",
+      changedAt: "2026-07-19T06:20:00.000Z",
+      lockedAt: "2026-07-19T06:20:01.000Z",
+    });
+    const lockTimeScope = locked.lock.lockedSnapshot?.race.dataScope;
+    const current = { ...locked, dataScope: "test" as const };
+
+    const restored = parseRace(exportRace(current));
+    expect(restored.dataScope).toBe("test");
+    expect(restored.lock.lockedSnapshot?.race.dataScope).toBe(lockTimeScope);
+  });
+
   it("任意拡張のない従来RACE/1文書も同じ既定値で読み込む", () => {
     const legacyRace = createDemoRace();
     delete legacyRace.status;
@@ -91,6 +125,22 @@ describe("RACE/1 round trip", () => {
     expect(exported).not.toMatch(/^ENTRIES:/m);
     expect(exported).not.toContain("postTimeLockedAt");
     expect(parseRace(exported)).toEqual(legacyRace);
+  });
+
+  it("CLIENT_KEYのない旧RACE/1文書はIDを安定キーとして補完する", () => {
+    const race = {
+      ...createDemoRace(),
+      id: "legacy-race-id",
+      clientKey: "separate-cloud-key",
+    };
+    const legacyDocument = exportRace(race).replace(
+      /^CLIENT_KEY:.*\n/m,
+      "",
+    );
+    expect(parseRace(legacyDocument)).toMatchObject({
+      id: "legacy-race-id",
+      clientKey: "legacy-race-id",
+    });
   });
 
   it("改行・引用符・日本語をJSON文字列として安全に往復する", () => {
@@ -170,6 +220,23 @@ describe("RACE/1 invalid input", () => {
     );
     expect(() => parseRaces(`${block}\n\n${block}`)).toThrow(
       /レースID .* が重複/,
+    );
+  });
+
+  it("別レースIDでも同じCLIENT_KEYの二重同期候補を拒否する", () => {
+    const first = createDemoRace();
+    const second = {
+      ...createDemoRace(),
+      id: "different-local-id",
+      clientKey: first.clientKey,
+      raceNumber: 10,
+    };
+    expect(() => exportRaces([first, second])).toThrow(/CLIENT_KEY .* が重複/);
+
+    const firstBlock = exportRace(first);
+    const secondBlock = exportRace(second);
+    expect(() => parseRaces(`${firstBlock}\n\n${secondBlock}`)).toThrow(
+      /CLIENT_KEY .* が重複/,
     );
   });
 

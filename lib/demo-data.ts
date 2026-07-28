@@ -62,6 +62,7 @@ const completedPrediction: RacePrediction = {
 
 export const DEMO_RACE: RaceRecord = {
   id: "race-2026-07-12-fukushima-11",
+  clientKey: "race-2026-07-12-fukushima-11",
   dataScope: "demo",
   date: "2026-07-12",
   course: "福島",
@@ -171,6 +172,7 @@ export const DEMO_RACE: RaceRecord = {
 
 export const DEMO_UPCOMING_RACE: RaceRecord = {
   id: "race-2026-07-19-hakodate-11",
+  clientKey: "race-2026-07-19-hakodate-11",
   dataScope: "demo",
   date: "2026-07-19",
   course: "函館",

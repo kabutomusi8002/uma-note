@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEMO_RACE } from "../lib/demo-data";
+import { exportRace, parseRace } from "../lib/race-format";
 import {
   databaseRecordToRace,
   raceToDatabasePayload,
@@ -8,6 +9,8 @@ import {
 describe("Supabase race adapter", () => {
   it("expands proposed and actual plans into separate database slips", () => {
     const payload = raceToDatabasePayload(DEMO_RACE);
+    expect(payload.client_key).toBe(DEMO_RACE.clientKey);
+    expect(payload).not.toHaveProperty("id");
     expect((payload.race as { data_scope: string }).data_scope).toBe("demo");
     const slips = payload.bet_slips as Array<{
       kind: string;
@@ -20,6 +23,75 @@ describe("Supabase race adapter", () => {
     expect(
       (payload.prediction as { revisions: unknown[] }).revisions,
     ).toHaveLength(2);
+  });
+
+  it("keeps the UI id separate and sends only the persisted clientKey", () => {
+    const payload = raceToDatabasePayload({
+      ...DEMO_RACE,
+      id: "33333333-3333-4333-8333-333333333333",
+      clientKey: "stable-offline-client-key",
+    });
+    expect(payload.client_key).toBe("stable-offline-client-key");
+    expect(payload).not.toHaveProperty("id");
+  });
+
+  it("keeps a post-time-only lock as imported current data, not immutable evidence", () => {
+    const payload = raceToDatabasePayload({
+      ...DEMO_RACE,
+      lock: {
+        ...DEMO_RACE.lock,
+        isLocked: false,
+        lockedAt: null,
+        lockedSnapshot: undefined,
+        postTimeLockedAt: "2026-07-12T06:45:00.000Z",
+      },
+    });
+    expect(payload.prediction).toMatchObject({
+      status: "draft",
+      locked_at: null,
+      post_time_locked_at: "2026-07-12T06:45:00.000Z",
+    });
+  });
+
+  it("does not turn the automatic post-time boundary into an explicit lock", () => {
+    const race = databaseRecordToRace({
+      id: "28d13b92-4e17-43e5-8eb5-3e94b70c1c3d",
+      client_key: "post-time-draft",
+      meeting: {
+        meeting_date: "2026-07-12",
+        racecourse: { code: "TOKYO", name_ja: "東京" },
+      },
+      race: {
+        race_number: 11,
+        data_scope: "test",
+        starts_at: "2026-07-12T15:45:00+09:00",
+        name: "発走時刻境界テスト",
+      },
+      entries: [],
+      prediction: {
+        status: "draft",
+        effective_status: "locked",
+        locked_at: null,
+        post_time_locked_at: "2026-07-12T06:45:00.000Z",
+        selections: [],
+        revisions: [],
+      },
+      bet_slips: [],
+      result: null,
+      reflection: null,
+    });
+
+    expect(race.lock).toMatchObject({
+      isLocked: false,
+      lockedAt: null,
+      postTimeLockedAt: "2026-07-12T06:45:00.000Z",
+    });
+    expect(race.lock.lockedSnapshot).toBeUndefined();
+    expect(raceToDatabasePayload(race).prediction).toMatchObject({
+      status: "draft",
+      locked_at: null,
+      locked_snapshot: null,
+    });
   });
 
   it("maps a database RPC record to the client race model", () => {
@@ -215,5 +287,154 @@ describe("Supabase race adapter", () => {
     const prediction = raceToDatabasePayload(race).prediction as Record<string, unknown>;
     expect(prediction.rule_version_id).toBe(ruleVersionId);
     expect(prediction).not.toHaveProperty("rule_snapshot");
+  });
+
+  it("maps canonical locked evidence back to the immutable client snapshot", () => {
+    const race = databaseRecordToRace({
+      id: "48d13b92-4e17-43e5-8eb5-3e94b70c1c3d",
+      client_key: "locked-client-race",
+      meeting: {
+        meeting_date: "2026-07-20",
+        racecourse: { code: "HAKODATE", name_ja: "函館" },
+      },
+      race: {
+        race_number: 12,
+        data_scope: "test",
+        starts_at: "2026-07-20T16:05:00+09:00",
+        name: "ロック証跡往復",
+      },
+      entries: [{ horse_number: 4, horse_name: "ノースライト" }],
+      prediction: {
+        status: "locked",
+        effective_status: "locked",
+        locked_at: "2026-07-20T06:50:00.000Z",
+        selections: [],
+        revisions: [],
+        locked_snapshot: {
+          schema_version: 1,
+          race: {
+            id: "48d13b92-4e17-43e5-8eb5-3e94b70c1c3d",
+            racecourse: { code: "HAKODATE", name_ja: "函館" },
+            meeting_date: "2026-07-20",
+            race_number: 12,
+            starts_at: "2026-07-20T16:05:00+09:00",
+            name: "ロック証跡往復",
+            data_scope: "demo",
+          },
+          prediction: {
+            rule_version_id: null,
+            rule_snapshot: {
+              id: "rule-v1",
+              name: "ロック用ルール",
+              version: "1.0.0",
+              rules: ["発走前に固定"],
+              createdAt: "2026-07-18T00:00:00.000Z",
+              isActive: true,
+            },
+            pace_scenario: "先行争い",
+            track_bias: "内有利",
+            decision: "buy",
+            summary: "固定済み",
+            created_at: "2026-07-20T06:00:00.000Z",
+          },
+          horse_selections: [
+            {
+              horse_number: 4,
+              horse_name: "ノースライト",
+              mark: "honmei",
+              is_selected: true,
+              is_dangerous_favorite: false,
+              is_longshot: true,
+              evaluation: "展開向く",
+            },
+          ],
+          proposal_slips: [
+            {
+              id: "proposal-1",
+              client_key: "proposal-1",
+              memo: "固定買い目",
+              tickets: [
+                {
+                  bet_type: "win",
+                  first_horse_number: 4,
+                  stake_yen: 300,
+                },
+              ],
+            },
+          ],
+        },
+      },
+      bet_slips: [],
+      result: null,
+      reflection: null,
+    });
+
+    expect(race.lock.lockedSnapshot).toMatchObject({
+      schemaVersion: 1,
+      race: {
+        id: "locked-client-race",
+        date: "2026-07-20",
+        course: "函館",
+        raceNumber: 12,
+        startTime: "16:05",
+        dataScope: "demo",
+      },
+      prediction: {
+        selectedHorses: [
+          { horseNumber: 4, horseName: "ノースライト", mark: "◎" },
+        ],
+        longshots: [4],
+        decision: "buy",
+      },
+      proposedBets: [{ betType: "win", stakePerPoint: 300 }],
+      ruleVersion: { id: "rule-v1", version: "1.0.0" },
+      lockedAt: "2026-07-20T06:50:00.000Z",
+    });
+    const restored = parseRace(exportRace(race));
+    expect(restored.lock.lockedSnapshot).toEqual(race.lock.lockedSnapshot);
+  });
+
+  it("falls back to the current race scope for a legacy canonical snapshot", () => {
+    const race = databaseRecordToRace({
+      id: "58d13b92-4e17-43e5-8eb5-3e94b70c1c3d",
+      client_key: "legacy-locked-client-race",
+      meeting: {
+        meeting_date: "2026-07-21",
+        racecourse: { code: "HAKODATE", name_ja: "函館" },
+      },
+      race: {
+        race_number: 10,
+        data_scope: "test",
+        starts_at: "2026-07-21T15:30:00+09:00",
+        name: "旧ロックスナップショット",
+      },
+      entries: [],
+      prediction: {
+        status: "locked",
+        effective_status: "locked",
+        locked_at: "2026-07-21T06:20:00.000Z",
+        selections: [],
+        revisions: [],
+        locked_snapshot: {
+          schema_version: 1,
+          race: {
+            id: "58d13b92-4e17-43e5-8eb5-3e94b70c1c3d",
+            racecourse: { code: "HAKODATE", name_ja: "函館" },
+            meeting_date: "2026-07-21",
+            race_number: 10,
+            starts_at: "2026-07-21T15:30:00+09:00",
+            name: "旧ロックスナップショット",
+          },
+          prediction: {},
+          horse_selections: [],
+          proposal_slips: [],
+        },
+      },
+      bet_slips: [],
+      result: null,
+      reflection: null,
+    });
+
+    expect(race.lock.lockedSnapshot?.race.dataScope).toBe("test");
   });
 });

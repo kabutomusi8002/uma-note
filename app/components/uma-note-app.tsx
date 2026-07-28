@@ -12,6 +12,7 @@ import {
   BET_METHOD_LABELS,
   BET_TYPE_LABELS,
   BET_TYPES,
+  DEFAULT_USER_SETTINGS,
   PREDICTION_MARKS,
   PURCHASE_DECISION_LABELS,
   REFLECTION_CATEGORY_LABELS,
@@ -23,6 +24,7 @@ import {
   type RaceRecord,
   type ReflectionCategory,
   type SelectedHorse,
+  type UserSettings,
 } from "@/lib/types";
 import {
   calculateBetSummary,
@@ -44,21 +46,78 @@ import {
   isSupabaseConfigured,
 } from "@/lib/supabase/client";
 import {
-  loadRaceRecords,
-  saveRaceRecord,
-} from "@/lib/supabase/race-repository";
+  readCloudAuthState,
+  requestEmailOtp,
+  signOutFromCloud,
+  subscribeToCloudAuth,
+  type CloudAuthState,
+  verifyEmailOtp,
+} from "@/lib/supabase/auth";
 import {
-  activateRuleVersion,
-  loadRuleVersions,
-  saveRuleVersion,
-} from "@/lib/supabase/rule-repository";
-import { lockRacePrediction } from "@/lib/prediction-lock";
+  loadSyncBootstrap,
+  subscribeToSyncChanges,
+  type SyncBootstrap,
+} from "@/lib/supabase/sync-repository";
+import { applyTrustedLocalMigration } from "@/lib/supabase/migration-repository";
+import { loadRaceSyncEnvelopeByClientKey } from "@/lib/supabase/race-repository";
+import {
+  lockRacePrediction,
+  upgradeLegacyPredictionLocks,
+} from "@/lib/prediction-lock";
 import {
   getRaceDataScope,
   isRaceIncludedInPerformance,
   normalizeKnownDemoRaceScopes,
   RACE_DATA_SCOPE_LABELS,
 } from "@/lib/race-scope";
+import {
+  LEGACY_OWNER_SCOPE,
+  commitSyncResolution,
+  enqueueMutation,
+  exportSyncSafetyBackup,
+  getWorkspace,
+  listConflicts,
+  listOutbox,
+  openLocalDatabase,
+  putConflict,
+  replaceWorkspace,
+  resolveConflict,
+  updateOutbox,
+  type LocalDatabase,
+} from "@/lib/storage/local-db";
+import {
+  createMutationId,
+  createOutboxMutation,
+  isOutboxMutationActionable,
+  ownerScopeForUser,
+} from "@/lib/sync/outbox";
+import { createSyncCoordinator, type SyncCoordinator } from "@/lib/sync/coordinator";
+import { pushOutboxMutation } from "@/lib/sync/supabase-adapter";
+import { createSyncConflict } from "@/lib/sync/reconciler";
+import { prepareRaceConflictResolution } from "@/lib/sync/race-recovery";
+import type {
+  AuthState as SyncAuthState,
+  OutboxMutation,
+  OwnerScope,
+  SyncConflict,
+  SyncCoordinatorStatus,
+  WorkspaceSnapshot,
+} from "@/lib/sync/types";
+import {
+  assertNoDuplicateRaces,
+  backfillRaceClientKey,
+  raceClientKey,
+  raceNaturalKey,
+} from "@/lib/race-identity";
+import { ruleIdentityKey } from "@/lib/rule-identity";
+import { canonicalJson, type LocalBackup } from "@/lib/sync/backup-format";
+import { migrationSemanticProjection } from "@/lib/sync/migration-plan";
+import {
+  connectionPresentationFor,
+  type CloudConnectionProbe,
+} from "@/lib/sync/connection-presentation";
+import { SyncConflictDialog } from "./sync-conflict-dialog";
+import { CloudMigrationPanel } from "./cloud-migration-panel";
 
 type AppView = "home" | "race" | "analysis" | "rules" | "settings";
 type RaceStage = "prediction" | "bets" | "result" | "review";
@@ -67,8 +126,10 @@ const LOCAL_RACES_KEY = "uma-note:races:v1";
 const LOCAL_RULES_KEY = "uma-note:rules:v1";
 const LOCAL_ACTIVE_RACE_KEY = "uma-note:active-race:v1";
 const LOCAL_DIRTY_RACES_KEY = "uma-note:dirty-races:v1";
+const LOCAL_SETTINGS_KEY = "uma-note:settings:v1";
+const INSTALLATION_ID_KEY = "uma-note:installation-id:v1";
+const ACTIVE_OWNER_SCOPE_KEY = "uma-note:active-owner-scope:v1";
 const CLOUD_SAVE_DELAY_MS = 700;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const NAV_ITEMS: readonly {
   id: AppView;
@@ -152,12 +213,17 @@ function cloneRule(rule: PredictionRuleVersion | null): PredictionRuleVersion | 
   return rule ? JSON.parse(JSON.stringify(rule)) as PredictionRuleVersion : null;
 }
 
-function makeBlankRace(rule: PredictionRuleVersion | null): RaceRecord {
+function makeBlankRace(
+  rule: PredictionRuleVersion | null,
+  settings: UserSettings,
+): RaceRecord {
   const now = new Date().toISOString();
   const schedule = newRaceScheduleInJapan();
+  const id = makeId("race");
   return {
-    id: makeId("race"),
-    dataScope: "live",
+    id,
+    clientKey: id,
+    dataScope: settings.defaultDataScope,
     date: schedule.date,
     course: "東京",
     raceNumber: 11,
@@ -258,38 +324,19 @@ function isRuleVersionArray(value: unknown): value is PredictionRuleVersion[] {
   ));
 }
 
-function mergeCloudById<T extends { id: string }>(
-  localItems: readonly T[],
-  cloudItems: readonly T[],
-): T[] {
-  const cloudIds = new Set(cloudItems.map((item) => item.id));
-  return [...cloudItems, ...localItems.filter((item) => !cloudIds.has(item.id))];
-}
-
-function mergeCloudRaces(
-  localRaces: readonly RaceRecord[],
-  cloudRaces: readonly RaceRecord[],
-  dirtyIds: ReadonlySet<string>,
-): RaceRecord[] {
-  const dirtyLocal = localRaces.filter((race) => dirtyIds.has(race.id));
-  const dirtyById = new Map(dirtyLocal.map((race) => [race.id, race]));
-  const naturalKey = (race: RaceRecord) =>
-    `${race.date}|${race.course}|${race.raceNumber}`;
-  const dirtyByNaturalKey = new Map(
-    dirtyLocal.map((race) => [naturalKey(race), race]),
+function isUserSettings(value: unknown): value is UserSettings {
+  if (value === null || typeof value !== "object") return false;
+  const settings = value as Partial<UserSettings>;
+  return (
+    settings.timezone === "Asia/Tokyo" &&
+    Number.isInteger(settings.defaultStakePerPoint) &&
+    Number(settings.defaultStakePerPoint) >= 100 &&
+    (settings.defaultDataScope === "live" ||
+      settings.defaultDataScope === "demo" ||
+      settings.defaultDataScope === "test") &&
+    (settings.activeRuleVersionId === null ||
+      typeof settings.activeRuleVersionId === "string")
   );
-  const usedLocalIds = new Set<string>();
-  const merged = cloudRaces.map((cloudRace) => {
-    const localRace = dirtyById.get(cloudRace.id) ??
-      dirtyByNaturalKey.get(naturalKey(cloudRace));
-    if (!localRace) return cloudRace;
-    usedLocalIds.add(localRace.id);
-    return localRace;
-  });
-  return [
-    ...merged,
-    ...dirtyLocal.filter((race) => !usedLocalIds.has(race.id)),
-  ];
 }
 
 function persistDirtyIds(key: string, ids: ReadonlySet<string>) {
@@ -317,6 +364,43 @@ function getServerConnectionSnapshot(): boolean {
   return true;
 }
 
+function getOrCreateInstallationId(): string {
+  try {
+    const stored = localStorage.getItem(INSTALLATION_ID_KEY);
+    if (stored) return stored;
+    const created = createMutationId();
+    localStorage.setItem(INSTALLATION_ID_KEY, created);
+    return created;
+  } catch {
+    return createMutationId();
+  }
+}
+
+function syncEntityKey(entityType: OutboxMutation["entityType"], entityKey: string) {
+  return `${entityType}:${entityKey}`;
+}
+
+function ruleSetSyncKey(rule: Pick<PredictionRuleVersion, "name">): string {
+  return rule.name.trim();
+}
+
+function ruleSemanticValue(rule: PredictionRuleVersion): unknown {
+  return {
+    name: rule.name,
+    version: rule.version,
+    rules: rule.rules,
+    note: rule.note ?? "",
+  };
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  try {
+    return canonicalJson(left) === canonicalJson(right);
+  } catch {
+    return false;
+  }
+}
+
 function parseHorseNumbers(value: string): number[] {
   if (!value.trim()) return [];
   const values = value
@@ -331,25 +415,73 @@ function parseHorseNumbers(value: string): number[] {
 
 export function UmaNoteApp() {
   const [view, setView] = useState<AppView>("home");
-  const [races, setRaces] = useState<RaceRecord[]>(() => createDemoRaces());
+  const [races, setRaces] = useState<RaceRecord[]>(() =>
+    upgradeLegacyPredictionLocks(createDemoRaces()),
+  );
   const [activeRaceId, setActiveRaceId] = useState(() => createDemoRaces()[0]?.id ?? "");
   const [rules, setRules] = useState<PredictionRuleVersion[]>([
     { ...DEMO_RULE_VERSION },
   ]);
+  const [settings, setSettings] = useState<UserSettings>({
+    ...DEFAULT_USER_SETTINGS,
+  });
   const [toast, setToast] = useState<string | null>(null);
   const [storageReady, setStorageReady] = useState(false);
+  const [localDatabase, setLocalDatabase] = useState<LocalDatabase | null>(null);
+  const [pendingSyncCount, setPendingSyncCount] = useState(0);
+  const [syncConflicts, setSyncConflicts] = useState<SyncConflict[]>([]);
+  const [syncStatus, setSyncStatus] = useState<SyncCoordinatorStatus>({
+    phase: "idle",
+    pendingCount: 0,
+  });
+  const [activeOwnerScope, setActiveOwnerScope] = useState<OwnerScope>(
+    LEGACY_OWNER_SCOPE,
+  );
   const supabaseConfigured = isSupabaseConfigured();
+  const [cloudAuthStatus, setCloudAuthStatus] = useState<CloudAuthState["status"]>(
+    supabaseConfigured ? "checking" : "local",
+  );
+  const [cloudConnectionProbe, setCloudConnectionProbe] = useState<CloudConnectionProbe>(
+    supabaseConfigured ? "checking" : "local",
+  );
   const cloudUserIdRef = useRef<string | null>(null);
-  const loadedCloudUserRef = useRef<string | null>(null);
+  const authEpochRef = useRef(0);
+  const authIdentityRef = useRef(supabaseConfigured ? "checking" : "local");
+  const cloudProbeRequestRef = useRef(0);
+  const workspaceSwitchRequestRef = useRef(0);
+  const syncStateRequestRef = useRef(0);
+  const localMigrationAbortRef = useRef<AbortController | null>(null);
+  const ownerScopeRef = useRef<OwnerScope>(LEGACY_OWNER_SCOPE);
+  const syncAuthRef = useRef<SyncAuthState>({ status: "anonymous" });
+  const localDatabaseRef = useRef<LocalDatabase | null>(null);
+  const syncCoordinatorRef = useRef<SyncCoordinator | null>(null);
+  const installationIdRef = useRef("");
+  const pendingMutationsRef = useRef<OutboxMutation[]>([]);
+  const migrationAttemptKeysRef = useRef(new Map<string, string>());
+  const lastCloudBootstrapRef = useRef<SyncBootstrap | null>(null);
+  const cloudPreviewSnapshotsRef = useRef(new Map<
+    string,
+    { userId: string; bootstrap: SyncBootstrap }
+  >());
+  const cloudVersionsRef = useRef(new Map<string, number>());
+  const cloudRuleSetVersionsRef = useRef(new Map<string, number>());
+  const cloudBaseSnapshotsRef = useRef(new Map<string, unknown>());
+  const cloudRaceByNaturalKeyRef = useRef(new Map<
+    string,
+    { clientKey: string; version: number; value: RaceRecord }
+  >());
+  const cloudRaceAliasesRef = useRef(new Map<string, string>());
+  const cloudRuleByIdentityRef = useRef(new Map<
+    string,
+    { clientKey: string; version: number; value: PredictionRuleVersion }
+  >());
+  const cloudRuleAliasesRef = useRef(new Map<string, string>());
   const dirtyRaceIdsRef = useRef(new Set<string>());
   const racesRef = useRef(races);
-  const cloudRaceIdsRef = useRef(new Map<string, string>());
-  const cloudRuleIdsRef = useRef(new Map<string, string>());
-  const raceSaveTimersRef = useRef(new Map<string, number>());
-  const ruleSaveTimersRef = useRef(new Map<string, number>());
-  const raceSaveChainsRef = useRef(new Map<string, Promise<void>>());
-  const ruleSaveChainRef = useRef<Promise<void>>(Promise.resolve());
-  const latestRuleActivationRef = useRef(0);
+  const rulesRef = useRef(rules);
+  const settingsRef = useRef(settings);
+  const activeRaceIdRef = useRef(activeRaceId);
+  const syncTimerRef = useRef<number | null>(null);
   const online = useSyncExternalStore(
     subscribeToConnection,
     getConnectionSnapshot,
@@ -361,12 +493,28 @@ export function UmaNoteApp() {
   }, [races]);
 
   useEffect(() => {
+    rulesRef.current = rules;
+  }, [rules]);
+
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  useEffect(() => {
+    activeRaceIdRef.current = activeRaceId;
+  }, [activeRaceId]);
+
+  useEffect(() => {
     let cancelled = false;
     const timer = window.setTimeout(() => {
       try {
+        if (ownerScopeRef.current !== LEGACY_OWNER_SCOPE) return;
         const storedRaces = JSON.parse(localStorage.getItem(LOCAL_RACES_KEY) ?? "null") as unknown;
         const storedRules = JSON.parse(localStorage.getItem(LOCAL_RULES_KEY) ?? "null") as unknown;
         const storedActiveRaceId = localStorage.getItem(LOCAL_ACTIVE_RACE_KEY);
+        const storedSettings = JSON.parse(
+          localStorage.getItem(LOCAL_SETTINGS_KEY) ?? "null",
+        ) as unknown;
         const storedDirtyRaceIds = JSON.parse(
           localStorage.getItem(LOCAL_DIRTY_RACES_KEY) ?? "[]",
         ) as unknown;
@@ -378,9 +526,11 @@ export function UmaNoteApp() {
         }
 
         if (!cancelled && isRaceRecordArray(storedRaces)) {
-          const hydratedRaces = normalizeKnownDemoRaceScopes(
-            storedRaces,
-            DEMO_RACE_IDS,
+          const hydratedRaces = upgradeLegacyPredictionLocks(
+            normalizeKnownDemoRaceScopes(
+              storedRaces.map((race) => backfillRaceClientKey(race)),
+              DEMO_RACE_IDS,
+            ),
           );
           setRaces(hydratedRaces);
           setActiveRaceId(
@@ -391,6 +541,9 @@ export function UmaNoteApp() {
         }
         if (!cancelled && isRuleVersionArray(storedRules) && storedRules.length) {
           setRules(storedRules);
+        }
+        if (!cancelled && isUserSettings(storedSettings)) {
+          setSettings(storedSettings);
         }
       } catch {
         if (!cancelled) setToast("端末内データを読み込めなかったため、デモデータで開始しました");
@@ -407,9 +560,32 @@ export function UmaNoteApp() {
   useEffect(() => {
     if (!storageReady) return;
     try {
-      localStorage.setItem(LOCAL_RACES_KEY, JSON.stringify(races));
-      localStorage.setItem(LOCAL_RULES_KEY, JSON.stringify(rules));
-      localStorage.setItem(LOCAL_ACTIVE_RACE_KEY, activeRaceId);
+      if (ownerScopeRef.current === LEGACY_OWNER_SCOPE) {
+        localStorage.setItem(LOCAL_RACES_KEY, JSON.stringify(races));
+        localStorage.setItem(LOCAL_RULES_KEY, JSON.stringify(rules));
+        localStorage.setItem(LOCAL_ACTIVE_RACE_KEY, activeRaceId);
+        localStorage.setItem(LOCAL_SETTINGS_KEY, JSON.stringify(settings));
+      }
+      const database = localDatabaseRef.current;
+      if (database) {
+        void replaceWorkspace(database, {
+          ownerScope: ownerScopeRef.current,
+          races,
+          rules,
+          settings: {
+            activeRaceId,
+            userSettings: settings,
+            cloudSync: {
+              versions: Object.fromEntries(cloudVersionsRef.current),
+              ruleSetVersions: Object.fromEntries(cloudRuleSetVersionsRef.current),
+              bases: Object.fromEntries(cloudBaseSnapshotsRef.current),
+            },
+          },
+          updatedAt: new Date().toISOString(),
+        }).catch(() => {
+          setToast("IndexedDBへの保存に失敗しました。localStorageのコピーは保持されています");
+        });
+      }
     } catch {
       const timer = window.setTimeout(
         () => setToast("端末内への自動保存に失敗しました。空き容量を確認してください"),
@@ -417,87 +593,431 @@ export function UmaNoteApp() {
       );
       return () => window.clearTimeout(timer);
     }
-  }, [activeRaceId, races, rules, storageReady]);
+  }, [activeRaceId, races, rules, settings, storageReady]);
 
-  useEffect(() => {
-    if (!storageReady || !supabaseConfigured) return;
-    const client = getSupabaseClient();
-    let cancelled = false;
+  const refreshSyncState = useCallback(async (scope = ownerScopeRef.current) => {
+    const request = syncStateRequestRef.current + 1;
+    syncStateRequestRef.current = request;
+    const database = localDatabaseRef.current;
+    if (!database) return false;
+    const [outbox, conflicts] = await Promise.all([
+      listOutbox(database, scope),
+      listConflicts(database, scope),
+    ]);
+    if (
+      syncStateRequestRef.current !== request ||
+      ownerScopeRef.current !== scope
+    ) {
+      return false;
+    }
+    setPendingSyncCount(outbox.filter(isOutboxMutationActionable).length);
+    setSyncConflicts(conflicts.filter((conflict) => conflict.status === "unresolved"));
+    return true;
+  }, []);
 
-    async function loadForUser(userId: string) {
-      if (cancelled || loadedCloudUserRef.current === userId) return;
-      loadedCloudUserRef.current = userId;
-      cloudUserIdRef.current = userId;
-      const [raceResult, ruleResult] = await Promise.allSettled([
-        loadRaceRecords(client),
-        loadRuleVersions(client),
-      ]);
-      if (cancelled || cloudUserIdRef.current !== userId) return;
+  const switchWorkspace = useCallback(async (
+    scope: OwnerScope,
+    options: { remember?: boolean } = {},
+  ) => {
+    const switchRequest = workspaceSwitchRequestRef.current + 1;
+    workspaceSwitchRequestRef.current = switchRequest;
+    syncStateRequestRef.current += 1;
+    setPendingSyncCount(0);
+    setSyncConflicts([]);
+    const database = localDatabaseRef.current;
+    if (!database) return false;
+    const workspace = await getWorkspace(database, scope);
+    if (workspaceSwitchRequestRef.current !== switchRequest) return false;
+    const fallbackRaces = scope === LEGACY_OWNER_SCOPE
+      ? upgradeLegacyPredictionLocks(createDemoRaces())
+      : [];
+    const nextRaces = workspace
+      ? upgradeLegacyPredictionLocks(
+          normalizeKnownDemoRaceScopes(workspace.races, DEMO_RACE_IDS),
+        )
+      : fallbackRaces;
+    const nextRules = workspace?.rules ?? (
+      scope === LEGACY_OWNER_SCOPE ? [{ ...DEMO_RULE_VERSION }] : []
+    );
+    const workspaceSettings = workspace?.settings.userSettings;
+    const nextSettings = isUserSettings(workspaceSettings)
+      ? workspaceSettings
+      : { ...DEFAULT_USER_SETTINGS };
+    const storedActiveRaceId = typeof workspace?.settings.activeRaceId === "string"
+      ? workspace.settings.activeRaceId
+      : "";
+    const nextActiveRaceId = nextRaces.some((race) => race.id === storedActiveRaceId)
+      ? storedActiveRaceId
+      : (nextRaces[0]?.id ?? "");
 
-      if (raceResult.status === "fulfilled" && raceResult.value.length) {
-        for (const race of raceResult.value) cloudRaceIdsRef.current.set(race.id, race.id);
-        setRaces((current) => mergeCloudRaces(
-          current,
-          raceResult.value,
-          dirtyRaceIdsRef.current,
-        ));
-        setActiveRaceId((current) => (
-          dirtyRaceIdsRef.current.has(current) ||
-          raceResult.value.some((race) => race.id === current)
-            ? current
-            : (raceResult.value[0]?.id ?? "")
-        ));
-      } else if (raceResult.status === "fulfilled") {
-        setRaces((current) => current.filter((race) =>
-          dirtyRaceIdsRef.current.has(race.id),
-        ));
-        setActiveRaceId((current) =>
-          dirtyRaceIdsRef.current.has(current) ? current : "",
+    cloudVersionsRef.current.clear();
+    cloudRuleSetVersionsRef.current.clear();
+    cloudBaseSnapshotsRef.current.clear();
+    cloudRaceByNaturalKeyRef.current.clear();
+    cloudRaceAliasesRef.current.clear();
+    cloudRuleByIdentityRef.current.clear();
+    cloudRuleAliasesRef.current.clear();
+    const cloudSync = workspace?.settings.cloudSync;
+    if (cloudSync !== null && typeof cloudSync === "object") {
+      const metadata = cloudSync as Record<string, unknown>;
+      if (metadata.versions !== null && typeof metadata.versions === "object") {
+        for (const [key, value] of Object.entries(
+          metadata.versions as Record<string, unknown>,
+        )) {
+          if (typeof value === "number" && Number.isFinite(value)) {
+            cloudVersionsRef.current.set(key, value);
+          }
+        }
+      }
+      if (
+        metadata.ruleSetVersions !== null &&
+        typeof metadata.ruleSetVersions === "object"
+      ) {
+        for (const [key, value] of Object.entries(
+          metadata.ruleSetVersions as Record<string, unknown>,
+        )) {
+          if (typeof value === "number" && Number.isFinite(value)) {
+            cloudRuleSetVersionsRef.current.set(key, value);
+          }
+        }
+      }
+      if (metadata.bases !== null && typeof metadata.bases === "object") {
+        for (const [key, value] of Object.entries(
+          metadata.bases as Record<string, unknown>,
+        )) {
+          cloudBaseSnapshotsRef.current.set(key, value);
+        }
+      }
+    }
+    for (const [key, value] of cloudBaseSnapshotsRef.current) {
+      const version = cloudVersionsRef.current.get(key) ?? 0;
+      if (key.startsWith("race:") && isRaceRecordArray([value])) {
+        const cloudRace = value as RaceRecord;
+        const clientKey = key.slice("race:".length);
+        cloudRaceByNaturalKeyRef.current.set(raceNaturalKey(cloudRace), {
+          clientKey,
+          version,
+          value: cloudRace,
+        });
+        const localIndex = nextRaces.findIndex(
+          (race) => raceNaturalKey(race) === raceNaturalKey(cloudRace),
         );
-      }
-      if (ruleResult.status === "fulfilled" && ruleResult.value.length) {
-        for (const rule of ruleResult.value) cloudRuleIdsRef.current.set(rule.id, rule.id);
-        const cloudActiveId = ruleResult.value.find((rule) => rule.isActive)?.id;
-        setRules((current) => mergeCloudById(current, ruleResult.value).map((rule) => ({
-          ...rule,
-          isActive: cloudActiveId ? rule.id === cloudActiveId : rule.isActive,
-        })));
-      }
-
-      const failures = [raceResult, ruleResult].filter((result) => result.status === "rejected");
-      if (failures.length) {
-        setToast("Supabaseの一部データを読み込めませんでした。端末内データは利用できます");
+        const local = localIndex < 0 ? undefined : nextRaces[localIndex];
+        if (local && local.clientKey !== clientKey) {
+          nextRaces[localIndex] = { ...local, clientKey };
+        }
+        if (local && local.id !== clientKey) {
+          cloudRaceAliasesRef.current.set(local.id, clientKey);
+        }
+      } else if (key.startsWith("rule:") && isRuleVersionArray([value])) {
+        const cloudRule = value as PredictionRuleVersion;
+        const clientKey = key.slice("rule:".length);
+        cloudRuleByIdentityRef.current.set(ruleIdentityKey(cloudRule), {
+          clientKey,
+          version,
+          value: cloudRule,
+        });
+        const local = nextRules.find(
+          (rule) => ruleIdentityKey(rule) === ruleIdentityKey(cloudRule),
+        );
+        if (local && local.id !== clientKey) {
+          cloudRuleAliasesRef.current.set(local.id, clientKey);
+        }
       }
     }
 
-    void client.auth.getUser().then(({ data, error }) => {
-      if (cancelled) return;
-      if (error) {
-        setToast("Supabaseのログイン状態を確認できませんでした");
-        return;
+    ownerScopeRef.current = scope;
+    setActiveOwnerScope(scope);
+    if (scope === LEGACY_OWNER_SCOPE) {
+      try {
+        const storedDirtyIds = JSON.parse(
+          localStorage.getItem(LOCAL_DIRTY_RACES_KEY) ?? "[]",
+        ) as unknown;
+        dirtyRaceIdsRef.current = new Set(
+          Array.isArray(storedDirtyIds)
+            ? storedDirtyIds.filter((id): id is string => typeof id === "string")
+            : [],
+        );
+      } catch {
+        dirtyRaceIdsRef.current = new Set();
       }
-      if (data.user) void loadForUser(data.user.id);
-    });
-    const { data } = client.auth.onAuthStateChange((_event, session) => {
-      window.setTimeout(() => {
-        if (cancelled) return;
-        if (session?.user) {
-          void loadForUser(session.user.id);
-        } else {
-          cloudUserIdRef.current = null;
-          loadedCloudUserRef.current = null;
+    } else {
+      dirtyRaceIdsRef.current = new Set();
+    }
+    racesRef.current = nextRaces;
+    rulesRef.current = nextRules;
+    settingsRef.current = nextSettings;
+    activeRaceIdRef.current = nextActiveRaceId;
+    setRaces(nextRaces);
+    setRules(nextRules);
+    setSettings(nextSettings);
+    setActiveRaceId(nextActiveRaceId);
+    if (options.remember && scope.startsWith("user:")) {
+      try {
+        localStorage.setItem(ACTIVE_OWNER_SCOPE_KEY, scope);
+      } catch {
+        // IndexedDB remains authoritative if this convenience marker fails.
+      }
+    }
+    await refreshSyncState(scope);
+    syncCoordinatorRef.current?.notifyAuthChanged();
+    return true;
+  }, [refreshSyncState]);
+
+  useEffect(() => {
+    let cancelled = false;
+    installationIdRef.current = getOrCreateInstallationId();
+    void openLocalDatabase({ legacyOwnerScope: LEGACY_OWNER_SCOPE }).then(
+      async (database) => {
+        if (cancelled) {
+          database.close();
+          return;
         }
-      }, 0);
-    });
+        localDatabaseRef.current = database;
+        setLocalDatabase(database);
+        for (const mutation of pendingMutationsRef.current.splice(0)) {
+          await enqueueMutation(database, mutation);
+        }
+        const auth = syncAuthRef.current;
+        let rememberedScope: string | null = null;
+        try {
+          rememberedScope = localStorage.getItem(ACTIVE_OWNER_SCOPE_KEY);
+        } catch {
+          rememberedScope = null;
+        }
+        if (
+          auth.status === "authenticated" &&
+          rememberedScope === ownerScopeForUser(auth.userId)
+        ) {
+          await switchWorkspace(ownerScopeForUser(auth.userId));
+        } else {
+          await refreshSyncState();
+        }
+      },
+      () => {
+        if (!cancelled) {
+          setToast("端末DBを開けませんでした。localStorageモードで継続します");
+        }
+      },
+    );
     return () => {
       cancelled = true;
-      data.subscription.unsubscribe();
+      localDatabaseRef.current?.close();
+      localDatabaseRef.current = null;
     };
-  }, [storageReady, supabaseConfigured]);
+  }, [refreshSyncState, switchWorkspace]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const applyAuthState = (state: Awaited<ReturnType<typeof readCloudAuthState>>) => {
+      if (cancelled) return;
+      const authIdentity = state.status === "authenticated"
+        ? `authenticated:${state.user.id}`
+        : state.status;
+      if (authIdentityRef.current !== authIdentity) {
+        authIdentityRef.current = authIdentity;
+        authEpochRef.current += 1;
+        cloudProbeRequestRef.current += 1;
+        workspaceSwitchRequestRef.current += 1;
+        syncStateRequestRef.current += 1;
+        localMigrationAbortRef.current?.abort();
+        localMigrationAbortRef.current = null;
+        lastCloudBootstrapRef.current = null;
+        cloudPreviewSnapshotsRef.current.clear();
+        migrationAttemptKeysRef.current.clear();
+        setCloudConnectionProbe(
+          state.status === "local" ? "local" : "checking",
+        );
+      }
+      setCloudAuthStatus(state.status);
+      if (state.status === "authenticated") {
+        cloudUserIdRef.current = state.user.id;
+        syncAuthRef.current = { status: "authenticated", userId: state.user.id };
+        const userScope = ownerScopeForUser(state.user.id);
+        let rememberedScope: string | null = null;
+        try {
+          rememberedScope = localStorage.getItem(ACTIVE_OWNER_SCOPE_KEY);
+        } catch {
+          rememberedScope = null;
+        }
+        if (ownerScopeRef.current !== userScope) {
+          void switchWorkspace(
+            rememberedScope === userScope ? userScope : LEGACY_OWNER_SCOPE,
+          );
+        }
+      } else if (state.status === "expired") {
+        cloudUserIdRef.current = null;
+        syncAuthRef.current = { status: "expired" };
+        if (ownerScopeRef.current !== LEGACY_OWNER_SCOPE) {
+          void switchWorkspace(LEGACY_OWNER_SCOPE);
+        }
+      } else {
+        cloudUserIdRef.current = null;
+        syncAuthRef.current = { status: "anonymous" };
+        if (ownerScopeRef.current !== LEGACY_OWNER_SCOPE) {
+          void switchWorkspace(LEGACY_OWNER_SCOPE);
+        }
+      }
+      if (ownerScopeRef.current === LEGACY_OWNER_SCOPE) {
+        void refreshSyncState(LEGACY_OWNER_SCOPE);
+      }
+      syncCoordinatorRef.current?.notifyAuthChanged();
+    };
+
+    if (!supabaseConfigured) {
+      applyAuthState({ status: "local", user: null, session: null });
+      return;
+    }
+    void readCloudAuthState().then(applyAuthState);
+    const unsubscribe = subscribeToCloudAuth(applyAuthState);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [refreshSyncState, supabaseConfigured, switchWorkspace]);
+
+  useEffect(() => {
+    if (!localDatabase || !supabaseConfigured) return;
+    const client = getSupabaseClient();
+    const coordinator = createSyncCoordinator({
+      database: localDatabase,
+      getOwnerScope: () => ownerScopeRef.current,
+      getAuthState: () => syncAuthRef.current,
+      push: (mutation, context) =>
+        pushOutboxMutation(
+          client,
+          mutation,
+          installationIdRef.current,
+          context.signal,
+        ),
+      pullAfterPush: false,
+      onApplied: async (mutation, result) => {
+        const key = syncEntityKey(mutation.entityType, mutation.entityKey);
+        const mutationUserId = mutation.ownerScope.startsWith("user:")
+          ? mutation.ownerScope.slice("user:".length)
+          : null;
+        const currentAuth = syncAuthRef.current;
+        const appliesToCurrentWorkspace = Boolean(
+          mutationUserId &&
+            currentAuth.status === "authenticated" &&
+            currentAuth.userId === mutationUserId &&
+            ownerScopeRef.current === mutation.ownerScope,
+        );
+        if (!appliesToCurrentWorkspace) {
+          const workspace = await getWorkspace(localDatabase, mutation.ownerScope);
+          if (workspace) {
+            const rawCloudSync = workspace.settings.cloudSync;
+            const cloudSync = rawCloudSync !== null && typeof rawCloudSync === "object"
+              ? rawCloudSync as Record<string, unknown>
+              : {};
+            const versions = cloudSync.versions !== null && typeof cloudSync.versions === "object"
+              ? { ...(cloudSync.versions as Record<string, unknown>) }
+              : {};
+            const ruleSetVersions =
+              cloudSync.ruleSetVersions !== null &&
+              typeof cloudSync.ruleSetVersions === "object"
+                ? { ...(cloudSync.ruleSetVersions as Record<string, unknown>) }
+                : {};
+            const bases = cloudSync.bases !== null && typeof cloudSync.bases === "object"
+              ? { ...(cloudSync.bases as Record<string, unknown>) }
+              : {};
+            versions[key] = result.cloudVersion;
+            if (
+              mutation.entityType === "rule" &&
+              result.cloudParentVersion !== undefined &&
+              mutation.payload
+            ) {
+              ruleSetVersions[
+                ruleSetSyncKey(mutation.payload as PredictionRuleVersion)
+              ] = result.cloudParentVersion;
+            }
+            if (result.serverValue !== undefined) bases[key] = result.serverValue;
+            await replaceWorkspace(localDatabase, {
+              ...workspace,
+              settings: {
+                ...workspace.settings,
+                cloudSync: { versions, ruleSetVersions, bases },
+              },
+              updatedAt: new Date().toISOString(),
+            });
+          }
+          return;
+        }
+        cloudVersionsRef.current.set(key, result.cloudVersion);
+        if (
+          mutation.entityType === "rule" &&
+          result.cloudParentVersion !== undefined &&
+          mutation.payload
+        ) {
+          cloudRuleSetVersionsRef.current.set(
+            ruleSetSyncKey(mutation.payload as PredictionRuleVersion),
+            result.cloudParentVersion,
+          );
+        }
+        if (result.serverValue !== undefined) {
+          cloudBaseSnapshotsRef.current.set(key, result.serverValue);
+        }
+        if (mutation.entityType === "race") {
+          const payload = mutation.payload as RaceRecord | null;
+          const localId = [...cloudRaceAliasesRef.current.entries()].find(
+            ([, cloudId]) => cloudId === mutation.entityKey,
+          )?.[0] ?? mutation.entityKey;
+          const latest = racesRef.current.find((race) => race.id === localId);
+          if (payload && latest?.updatedAt === payload.updatedAt) {
+            dirtyRaceIdsRef.current.delete(localId);
+            if (ownerScopeRef.current === LEGACY_OWNER_SCOPE) {
+              persistDirtyIds(LOCAL_DIRTY_RACES_KEY, dirtyRaceIdsRef.current);
+            }
+          }
+        }
+        await replaceWorkspace(localDatabase, {
+          ownerScope: ownerScopeRef.current,
+          races: racesRef.current,
+          rules: rulesRef.current,
+          settings: {
+            activeRaceId: activeRaceIdRef.current,
+            userSettings: settingsRef.current,
+            cloudSync: {
+              versions: Object.fromEntries(cloudVersionsRef.current),
+              ruleSetVersions: Object.fromEntries(cloudRuleSetVersionsRef.current),
+              bases: Object.fromEntries(cloudBaseSnapshotsRef.current),
+            },
+          },
+          updatedAt: new Date().toISOString(),
+        });
+        setCloudConnectionProbe("ready");
+        await refreshSyncState();
+      },
+      onConflict: async () => {
+        await refreshSyncState();
+        setToast("クラウドと端末の変更が競合しています。比較画面で選択してください");
+      },
+      onStatus: (status) => {
+        setSyncStatus(status);
+        setPendingSyncCount(status.pendingCount);
+        if (
+          status.phase === "error" ||
+          status.phase === "auth-required" ||
+          status.phase === "owner-mismatch" ||
+          status.phase === "stopped"
+        ) {
+          setCloudConnectionProbe("error");
+        }
+      },
+    });
+    syncCoordinatorRef.current = coordinator;
+    coordinator.start();
+    return () => {
+      coordinator.stop();
+      if (syncCoordinatorRef.current === coordinator) {
+        syncCoordinatorRef.current = null;
+      }
+    };
+  }, [localDatabase, refreshSyncState, supabaseConfigured]);
 
   useEffect(() => () => {
-    for (const timer of raceSaveTimersRef.current.values()) window.clearTimeout(timer);
-    for (const timer of ruleSaveTimersRef.current.values()) window.clearTimeout(timer);
+    if (syncTimerRef.current !== null) window.clearTimeout(syncTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -515,198 +1035,1136 @@ export function UmaNoteApp() {
 
   function markRaceDirty(id: string) {
     dirtyRaceIdsRef.current.add(id);
-    persistDirtyIds(LOCAL_DIRTY_RACES_KEY, dirtyRaceIdsRef.current);
+    if (ownerScopeRef.current === LEGACY_OWNER_SCOPE) {
+      persistDirtyIds(LOCAL_DIRTY_RACES_KEY, dirtyRaceIdsRef.current);
+    }
   }
 
-  function clearRaceDirty(localId: string, cloudId?: string) {
-    dirtyRaceIdsRef.current.delete(localId);
-    if (cloudId) dirtyRaceIdsRef.current.delete(cloudId);
-    persistDirtyIds(LOCAL_DIRTY_RACES_KEY, dirtyRaceIdsRef.current);
-  }
+  const enqueueDurableMutation = useCallback((mutation: OutboxMutation) => {
+    const database = localDatabaseRef.current;
+    const enqueue = database
+      ? replaceWorkspace(database, {
+          ownerScope: mutation.ownerScope,
+          races: racesRef.current,
+          rules: rulesRef.current,
+          settings: {
+            activeRaceId: activeRaceIdRef.current,
+            userSettings: settingsRef.current,
+            cloudSync: {
+              versions: Object.fromEntries(cloudVersionsRef.current),
+              ruleSetVersions: Object.fromEntries(cloudRuleSetVersionsRef.current),
+              bases: Object.fromEntries(cloudBaseSnapshotsRef.current),
+            },
+          },
+          updatedAt: new Date().toISOString(),
+        }, [mutation]).then(() => mutation)
+      : (pendingMutationsRef.current.push(mutation), Promise.resolve(mutation));
+    void enqueue
+      .then(async () => {
+        await refreshSyncState(mutation.ownerScope);
+        if (mutation.ownerScope !== ownerScopeRef.current) return;
+        if (syncTimerRef.current !== null) window.clearTimeout(syncTimerRef.current);
+        syncTimerRef.current = window.setTimeout(() => {
+          syncTimerRef.current = null;
+          void syncCoordinatorRef.current?.flush("manual");
+        }, CLOUD_SAVE_DELAY_MS);
+      })
+      .catch(() => {
+        setToast("変更は画面内に保持されていますが、Outboxへの保存に失敗しました");
+      });
+  }, [refreshSyncState]);
 
   const queueRaceCloudSave = useCallback((race: RaceRecord) => {
-    const userId = cloudUserIdRef.current;
-    if (!supabaseConfigured || !userId) return;
-    const localId = race.id;
-    const existingTimer = raceSaveTimersRef.current.get(localId);
-    if (existingTimer) window.clearTimeout(existingTimer);
-
-    const timer = window.setTimeout(() => {
-      raceSaveTimersRef.current.delete(localId);
-      const previous = raceSaveChainsRef.current.get(localId) ?? Promise.resolve();
-      const job = previous
-        .catch(() => undefined)
-        .then(async () => {
-          if (cloudUserIdRef.current !== userId) return;
-          const mappedId = cloudRaceIdsRef.current.get(localId);
-          const client = getSupabaseClient();
-          let source = mappedId ? { ...race, id: mappedId } : race;
-          if (source.ruleVersion && !UUID_PATTERN.test(source.ruleVersion.id)) {
-            const mappedRuleId = cloudRuleIdsRef.current.get(source.ruleVersion.id);
-            const savedRule = mappedRuleId
-              ? { ...source.ruleVersion, id: mappedRuleId }
-              : await saveRuleVersion(client, {
-                  ...source.ruleVersion,
-                  isActive: false,
-                });
-            cloudRuleIdsRef.current.set(source.ruleVersion.id, savedRule.id);
-            cloudRuleIdsRef.current.set(savedRule.id, savedRule.id);
-            source = { ...source, ruleVersion: savedRule };
-          }
-          const saved = await saveRaceRecord(client, source);
-          const latest = racesRef.current.find((item) =>
-            item.id === localId || item.id === mappedId,
-          );
-          const hasNewerLocalEdit = Boolean(
-            latest && latest.updatedAt !== race.updatedAt,
-          );
-          cloudRaceIdsRef.current.set(localId, saved.id);
-          cloudRaceIdsRef.current.set(saved.id, saved.id);
-          setRaces((current) => current.map((item) => {
-            if (item.id !== localId && item.id !== mappedId) return item;
-            return item.updatedAt === race.updatedAt ? saved : { ...item, id: saved.id };
-          }));
-          setActiveRaceId((current) => (
-            current === localId || current === mappedId ? saved.id : current
-          ));
-          if (hasNewerLocalEdit) {
-            dirtyRaceIdsRef.current.delete(localId);
-            dirtyRaceIdsRef.current.add(saved.id);
-            persistDirtyIds(LOCAL_DIRTY_RACES_KEY, dirtyRaceIdsRef.current);
-          } else {
-            clearRaceDirty(localId, saved.id);
-          }
-        })
-        .catch(() => {
-          setToast("Supabaseへの自動保存に失敗しました。端末内には保存されています");
-        });
-      raceSaveChainsRef.current.set(localId, job);
-    }, CLOUD_SAVE_DELAY_MS);
-    raceSaveTimersRef.current.set(localId, timer);
-  }, [supabaseConfigured]);
+    const ownerScope = ownerScopeRef.current;
+    const entityKey = raceClientKey(race);
+    const key = syncEntityKey("race", entityKey);
+    enqueueDurableMutation(createOutboxMutation({
+      ownerScope,
+      entityType: "race",
+      entityKey,
+      payload: race,
+      baseSnapshot: cloudBaseSnapshotsRef.current.get(key) ?? null,
+      expectedVersion: cloudVersionsRef.current.get(key) ?? 0,
+    }));
+  }, [enqueueDurableMutation]);
 
   const queueRuleCloudAction = useCallback((
     rule: PredictionRuleVersion,
     action: "save" | "activate",
   ) => {
+    const payload = { ...rule, isActive: action === "activate" || rule.isActive };
+    const ownerScope = ownerScopeRef.current;
+    const entityKey = cloudRuleAliasesRef.current.get(rule.id) ?? rule.id;
+    const syncPayload = entityKey === payload.id
+      ? payload
+      : { ...payload, id: entityKey };
+    const key = syncEntityKey("rule", entityKey);
+    enqueueDurableMutation(createOutboxMutation({
+      ownerScope,
+      entityType: "rule",
+      entityKey,
+      payload: syncPayload,
+      baseSnapshot: cloudBaseSnapshotsRef.current.get(key) ?? null,
+      expectedVersion: cloudVersionsRef.current.get(key) ?? 0,
+      expectedParentVersion:
+        cloudRuleSetVersionsRef.current.get(ruleSetSyncKey(rule)) ?? 0,
+    }));
+  }, [enqueueDurableMutation]);
+
+  const queueSettingsCloudSave = useCallback((
+    nextSettings: UserSettings,
+    afterRuleWrite = false,
+  ) => {
+    const ownerScope = ownerScopeRef.current;
+    const key = syncEntityKey("settings", "profile");
+    const payload = nextSettings.activeRuleVersionId
+      ? {
+          ...nextSettings,
+          activeRuleVersionId:
+            cloudRuleAliasesRef.current.get(nextSettings.activeRuleVersionId) ??
+            nextSettings.activeRuleVersionId,
+        }
+      : nextSettings;
+    enqueueDurableMutation(createOutboxMutation(
+      {
+        ownerScope,
+        entityType: "settings",
+        entityKey: "profile",
+        payload,
+        baseSnapshot: cloudBaseSnapshotsRef.current.get(key) ?? null,
+        expectedVersion: cloudVersionsRef.current.get(key) ?? 0,
+      },
+      afterRuleWrite ? { now: () => new Date(Date.now() + 1) } : {},
+    ));
+  }, [enqueueDurableMutation]);
+
+  const loadCloudPreview = useCallback(async () => {
     const userId = cloudUserIdRef.current;
-    if (!supabaseConfigured || !userId) return;
-    const localId = rule.id;
-    const activationSequence = action === "activate"
-      ? ++latestRuleActivationRef.current
-      : latestRuleActivationRef.current;
-    const existingTimer = ruleSaveTimersRef.current.get(localId);
-    if (existingTimer) window.clearTimeout(existingTimer);
-
-    const timer = window.setTimeout(() => {
-      ruleSaveTimersRef.current.delete(localId);
-      const previous = ruleSaveChainRef.current;
-      const job = previous
-        .catch(() => undefined)
-        .then(async () => {
-          if (cloudUserIdRef.current !== userId) return;
-          if (
-            action === "activate" &&
-            activationSequence !== latestRuleActivationRef.current
-          ) return;
-          const mappedId = cloudRuleIdsRef.current.get(localId);
-          const cloudId = mappedId ?? (UUID_PATTERN.test(localId) ? localId : null);
-          if (action === "activate" && cloudId) {
-            await activateRuleVersion(getSupabaseClient(), cloudId);
-            return;
-          }
-
-          const saved = await saveRuleVersion(getSupabaseClient(), {
-            ...rule,
-            id: cloudId ?? rule.id,
-            isActive: action === "activate" ? true : rule.isActive,
-          });
-          cloudRuleIdsRef.current.set(localId, saved.id);
-          cloudRuleIdsRef.current.set(saved.id, saved.id);
-          setRules((current) => current.map((item) => (
-            item.id === localId
-              ? { ...saved, isActive: item.isActive }
-              : item
-          )));
-        })
-        .catch(() => {
-          setToast("予想ルールをSupabaseへ保存できませんでした。端末内には保存されています");
-        });
-      ruleSaveChainRef.current = job;
-    }, CLOUD_SAVE_DELAY_MS);
-    ruleSaveTimersRef.current.set(localId, timer);
+    if (!supabaseConfigured || !userId) {
+      throw new Error("Supabaseへログインしてからプレビューしてください。");
+    }
+    const authEpoch = authEpochRef.current;
+    const probeRequest = cloudProbeRequestRef.current + 1;
+    cloudProbeRequestRef.current = probeRequest;
+    setCloudConnectionProbe("checking");
+    let bootstrap: SyncBootstrap;
+    try {
+      bootstrap = await loadSyncBootstrap(getSupabaseClient());
+    } catch (cause) {
+      if (
+        authEpochRef.current === authEpoch &&
+        cloudUserIdRef.current === userId &&
+        cloudProbeRequestRef.current === probeRequest
+      ) {
+        setCloudConnectionProbe("error");
+      }
+      throw cause;
+    }
+    if (
+      authEpochRef.current !== authEpoch ||
+      cloudUserIdRef.current !== userId ||
+      cloudProbeRequestRef.current !== probeRequest
+    ) {
+      throw new Error("認証状態またはクラウド要求が変わったため、処理を安全に中止しました。");
+    }
+    lastCloudBootstrapRef.current = bootstrap;
+    const previewId = createMutationId();
+    cloudPreviewSnapshotsRef.current.set(previewId, {
+      userId,
+      bootstrap: structuredClone(bootstrap),
+    });
+    while (cloudPreviewSnapshotsRef.current.size > 5) {
+      const oldest = cloudPreviewSnapshotsRef.current.keys().next().value as
+        | string
+        | undefined;
+      if (!oldest) break;
+      cloudPreviewSnapshotsRef.current.delete(oldest);
+    }
+    setCloudConnectionProbe("ready");
+    return {
+      previewId,
+      races: bootstrap.races.map((record) => record.value),
+      rules: bootstrap.rules.map((record) => record.value),
+      settings: bootstrap.settings?.value ?? null,
+    };
   }, [supabaseConfigured]);
 
   const loadCloudManually = useCallback(async () => {
+    const userId = cloudUserIdRef.current;
+    const database = localDatabaseRef.current;
+    if (!userId || !database) {
+      throw new Error("Supabaseへログインしてから読み込んでください。");
+    }
+    const authEpoch = authEpochRef.current;
+    const ownerScope = ownerScopeForUser(userId);
+    const assertCurrentCloudOperation = (requireWorkspace = true) => {
+      if (
+        authEpochRef.current !== authEpoch ||
+        cloudUserIdRef.current !== userId ||
+        (requireWorkspace && ownerScopeRef.current !== ownerScope)
+      ) {
+        throw new Error("認証または作業領域が変わったため、クラウド処理を安全に中止しました。");
+      }
+    };
+    const existingWorkspace = await getWorkspace(database, ownerScope);
+    assertCurrentCloudOperation(false);
+    if (!(await switchWorkspace(ownerScope, { remember: true }))) {
+      throw new Error("クラウド用の端末作業領域を開けませんでした。");
+    }
+    assertCurrentCloudOperation();
+    const previousBases = new Map(cloudBaseSnapshotsRef.current);
+    const previousVersions = new Map(cloudVersionsRef.current);
+    const previousRuleSetVersions = new Map(cloudRuleSetVersionsRef.current);
+    const nextCloudBases = new Map(cloudBaseSnapshotsRef.current);
+    const nextCloudVersions = new Map(cloudVersionsRef.current);
+    const nextCloudRuleSetVersions = new Map(cloudRuleSetVersionsRef.current);
+    const nextCloudRaceAliases = new Map(cloudRaceAliasesRef.current);
+    const nextCloudRuleAliases = new Map(cloudRuleAliasesRef.current);
+    const nextCloudRaceByNaturalKey = new Map<
+      string,
+      { clientKey: string; version: number; value: RaceRecord }
+    >();
+    const nextCloudRuleByIdentity = new Map<
+      string,
+      { clientKey: string; version: number; value: PredictionRuleVersion }
+    >();
+    await loadCloudPreview();
+    assertCurrentCloudOperation();
+    const bootstrap = lastCloudBootstrapRef.current;
+    if (!bootstrap) throw new Error("クラウド同期データを取得できませんでした。");
+
+    for (const record of bootstrap.races) {
+      nextCloudRaceByNaturalKey.set(raceNaturalKey(record.value), record);
+    }
+    for (const record of bootstrap.rules) {
+      nextCloudRuleByIdentity.set(ruleIdentityKey(record.value), record);
+      if (record.parentVersion !== undefined) {
+        nextCloudRuleSetVersions.set(
+          ruleSetSyncKey(record.value),
+          record.parentVersion,
+        );
+      }
+    }
+
+    const pending = (await listOutbox(database, ownerScope))
+      .filter(isOutboxMutationActionable);
+    assertCurrentCloudOperation();
+    const pendingByEntity = new Map(
+      pending.map((mutation) => [
+        syncEntityKey(mutation.entityType, mutation.entityKey),
+        mutation,
+      ]),
+    );
+    const existingConflicts = await listConflicts(database, ownerScope);
+    assertCurrentCloudOperation();
+    const conflictMutationIds = new Set(
+      existingConflicts
+        .filter((conflict) => conflict.status === "unresolved")
+        .map((conflict) => conflict.mutationId),
+    );
+    const nextRaces = [...racesRef.current];
+    const nextRules = [...rulesRef.current];
+    let nextSettings = settingsRef.current;
+
+    const recordConflict = async (
+      mutation: OutboxMutation,
+      remote: unknown | null,
+      remoteVersion: number,
+      remoteParentVersion?: number,
+    ) => {
+      if (conflictMutationIds.has(mutation.mutationId)) return;
+      await putConflict(
+        database,
+        createSyncConflict(
+          mutation,
+          remote,
+          remoteVersion,
+          new Date(),
+          remoteParentVersion,
+        ),
+      );
+      if (pending.some((item) => item.mutationId === mutation.mutationId)) {
+        await updateOutbox(database, mutation.mutationId, {
+          status: "conflict",
+          inFlightAt: undefined,
+          updatedAt: new Date().toISOString(),
+          lastError: "Cloud changed while this device had a local value",
+        });
+      }
+      assertCurrentCloudOperation();
+      conflictMutationIds.add(mutation.mutationId);
+    };
+
+    for (const remote of bootstrap.races) {
+      const entityKey = remote.clientKey;
+      const key = syncEntityKey("race", entityKey);
+      const localIndex = nextRaces.findIndex((race) =>
+        race.id === entityKey || raceNaturalKey(race) === raceNaturalKey(remote.value),
+      );
+      if (localIndex < 0) {
+        nextRaces.push(remote.value);
+        nextCloudVersions.set(key, remote.version);
+        nextCloudBases.set(key, remote.value);
+        continue;
+      }
+      const local = nextRaces[localIndex]!;
+      if (local.id !== entityKey) nextCloudRaceAliases.set(local.id, entityKey);
+      const localForSync =
+        local.clientKey === entityKey ? local : { ...local, clientKey: entityKey };
+      nextRaces[localIndex] = localForSync;
+      const previousBase = previousBases.get(key);
+      const localMatchesRemote = sameJson(
+        migrationSemanticProjection(localForSync),
+        migrationSemanticProjection(remote.value),
+      );
+      const localMatchesBase = isRaceRecordArray([previousBase]) && sameJson(
+        migrationSemanticProjection(localForSync),
+        migrationSemanticProjection(previousBase as RaceRecord),
+      );
+      const pendingMutation = pendingByEntity.get(key);
+      if (localMatchesRemote) {
+        nextCloudVersions.set(key, remote.version);
+        nextCloudBases.set(key, remote.value);
+        continue;
+      }
+      if (
+        pendingMutation?.deliveryPolicy === "manual-review" &&
+        pendingMutation.rebase?.kind === "verified-receipt" &&
+        pendingMutation.rebase.cloudId === remote.cloudId &&
+        pendingMutation.rebase.cloudVersion === remote.version &&
+        pendingMutation.expectedVersion === remote.version &&
+        pendingMutation.payload !== null &&
+        isRaceRecordArray([pendingMutation.payload]) &&
+        sameJson(
+          migrationSemanticProjection(localForSync),
+          migrationSemanticProjection(pendingMutation.payload as RaceRecord),
+        )
+      ) {
+        // A verified rebase intentionally preserves a local-only difference.
+        // Pull may refresh its cloud base/version, but must not turn the held
+        // mutation into another conflict or transmit it automatically.
+        nextCloudVersions.set(key, remote.version);
+        nextCloudBases.set(key, remote.value);
+        continue;
+      }
+      if (localMatchesBase && !pendingMutation) {
+        nextRaces[localIndex] = {
+          ...remote.value,
+          id: local.id,
+          clientKey: entityKey,
+        };
+        nextCloudVersions.set(key, remote.version);
+        nextCloudBases.set(key, remote.value);
+        continue;
+      }
+      nextCloudBases.set(key, previousBase ?? null);
+      nextCloudVersions.set(key, previousVersions.get(key) ?? 0);
+      const mutation = pendingMutation ?? createOutboxMutation({
+        ownerScope,
+        entityType: "race",
+        entityKey,
+        payload: localForSync,
+        baseSnapshot: previousBase ?? null,
+        expectedVersion: previousVersions.get(key) ?? 0,
+      });
+      await recordConflict(mutation, remote.value, remote.version);
+    }
+
+    for (const remote of bootstrap.rules) {
+      const entityKey = remote.clientKey;
+      const key = syncEntityKey("rule", entityKey);
+      const localIndex = nextRules.findIndex((rule) =>
+        rule.id === entityKey || ruleIdentityKey(rule) === ruleIdentityKey(remote.value),
+      );
+      if (localIndex < 0) {
+        nextRules.push(remote.value);
+        nextCloudVersions.set(key, remote.version);
+        nextCloudBases.set(key, remote.value);
+        continue;
+      }
+      const local = nextRules[localIndex]!;
+      if (local.id !== entityKey) nextCloudRuleAliases.set(local.id, entityKey);
+      const localForSync = local.id === entityKey ? local : { ...local, id: entityKey };
+      const previousBase = previousBases.get(key);
+      const pendingMutation = pendingByEntity.get(key);
+      if (sameJson(ruleSemanticValue(localForSync), ruleSemanticValue(remote.value))) {
+        nextRules[localIndex] = remote.value;
+        nextCloudVersions.set(key, remote.version);
+        nextCloudBases.set(key, remote.value);
+        continue;
+      }
+      if (
+        previousBase &&
+        isRuleVersionArray([previousBase]) &&
+        sameJson(
+          ruleSemanticValue(localForSync),
+          ruleSemanticValue(previousBase as PredictionRuleVersion),
+        ) &&
+        !pendingMutation
+      ) {
+        nextRules[localIndex] = remote.value;
+        nextCloudVersions.set(key, remote.version);
+        nextCloudBases.set(key, remote.value);
+        continue;
+      }
+      nextCloudBases.set(key, previousBase ?? null);
+      nextCloudVersions.set(key, previousVersions.get(key) ?? 0);
+      const mutation = pendingMutation ?? createOutboxMutation({
+        ownerScope,
+        entityType: "rule",
+        entityKey,
+        payload: localForSync,
+        baseSnapshot: previousBase ?? null,
+        expectedVersion: previousVersions.get(key) ?? 0,
+        expectedParentVersion:
+          previousRuleSetVersions.get(ruleSetSyncKey(localForSync)) ?? 0,
+      });
+      await recordConflict(
+        mutation,
+        remote.value,
+        remote.version,
+        remote.parentVersion,
+      );
+    }
+
+    if (bootstrap.settings) {
+      const key = syncEntityKey("settings", "profile");
+      const previousBase = previousBases.get(key);
+      const pendingMutation = pendingByEntity.get(key);
+      if (!existingWorkspace || sameJson(nextSettings, bootstrap.settings.value)) {
+        nextSettings = bootstrap.settings.value;
+        nextCloudVersions.set(key, bootstrap.settings.version);
+        nextCloudBases.set(key, bootstrap.settings.value);
+      } else if (previousBase && sameJson(nextSettings, previousBase) && !pendingMutation) {
+        nextSettings = bootstrap.settings.value;
+        nextCloudVersions.set(key, bootstrap.settings.version);
+        nextCloudBases.set(key, bootstrap.settings.value);
+      } else {
+        nextCloudBases.set(key, previousBase ?? null);
+        nextCloudVersions.set(key, previousVersions.get(key) ?? 0);
+        const mutation = pendingMutation ?? createOutboxMutation({
+          ownerScope,
+          entityType: "settings",
+          entityKey: "profile",
+          payload: nextSettings,
+          baseSnapshot: previousBase ?? null,
+          expectedVersion: previousVersions.get(key) ?? 0,
+        });
+        await recordConflict(
+          mutation,
+          bootstrap.settings.value,
+          bootstrap.settings.version,
+        );
+      }
+    }
+
+    assertCurrentCloudOperation();
+    cloudVersionsRef.current = nextCloudVersions;
+    cloudRuleSetVersionsRef.current = nextCloudRuleSetVersions;
+    cloudBaseSnapshotsRef.current = nextCloudBases;
+    cloudRaceAliasesRef.current = nextCloudRaceAliases;
+    cloudRuleAliasesRef.current = nextCloudRuleAliases;
+    cloudRaceByNaturalKeyRef.current = nextCloudRaceByNaturalKey;
+    cloudRuleByIdentityRef.current = nextCloudRuleByIdentity;
+    racesRef.current = nextRaces;
+    rulesRef.current = nextRules;
+    settingsRef.current = nextSettings;
+    const nextActiveRaceId = nextRaces.some(
+      (race) => race.id === activeRaceIdRef.current,
+    ) ? activeRaceIdRef.current : (nextRaces[0]?.id ?? "");
+    activeRaceIdRef.current = nextActiveRaceId;
+    setRaces(nextRaces);
+    setRules(nextRules);
+    setSettings(nextSettings);
+    setActiveRaceId(nextActiveRaceId);
+    await replaceWorkspace(database, {
+      ownerScope,
+      races: nextRaces,
+      rules: nextRules,
+      settings: {
+        activeRaceId: nextActiveRaceId,
+        userSettings: nextSettings,
+        cloudSync: {
+          versions: Object.fromEntries(nextCloudVersions),
+          ruleSetVersions: Object.fromEntries(nextCloudRuleSetVersions),
+          bases: Object.fromEntries(nextCloudBases),
+        },
+      },
+      updatedAt: new Date().toISOString(),
+    });
+    assertCurrentCloudOperation();
+    await refreshSyncState(ownerScope);
+    assertCurrentCloudOperation();
+    await syncCoordinatorRef.current?.flush("manual");
+    assertCurrentCloudOperation();
+    return { races: bootstrap.races.length, rules: bootstrap.rules.length };
+  }, [loadCloudPreview, refreshSyncState, switchWorkspace]);
+
+  useEffect(() => {
+    const userId = cloudUserIdRef.current;
+    if (
+      !online ||
+      !supabaseConfigured ||
+      !userId ||
+      activeOwnerScope !== ownerScopeForUser(userId)
+    ) {
+      return;
+    }
     const client = getSupabaseClient();
-    const [cloudRaces, cloudRules] = await Promise.all([
-      loadRaceRecords(client),
-      loadRuleVersions(client),
-    ]);
-    if (cloudRaces.length) {
-      for (const race of cloudRaces) cloudRaceIdsRef.current.set(race.id, race.id);
-      setRaces(cloudRaces);
-      setActiveRaceId(cloudRaces[0]?.id ?? "");
-      dirtyRaceIdsRef.current.clear();
-      persistDirtyIds(LOCAL_DIRTY_RACES_KEY, dirtyRaceIdsRef.current);
-    }
-    if (cloudRules.length) {
-      for (const rule of cloudRules) cloudRuleIdsRef.current.set(rule.id, rule.id);
-      setRules(cloudRules);
-    }
-    return { races: cloudRaces.length, rules: cloudRules.length };
-  }, []);
+    let cancelled = false;
+    let timer: number | null = null;
+    let pulling = false;
+    let rerunRequested = false;
+    const pull = () => {
+      if (cancelled) return;
+      if (pulling) {
+        rerunRequested = true;
+        return;
+      }
+      pulling = true;
+      void loadCloudManually()
+        .catch((cause) => {
+          if (!cancelled) {
+            setToast(
+              cause instanceof Error
+                ? cause.message
+                : "クラウドの再接続同期に失敗しました。端末変更は保持されています。",
+            );
+          }
+        })
+        .finally(() => {
+          pulling = false;
+          if (rerunRequested && !cancelled) {
+            rerunRequested = false;
+            schedulePull();
+          }
+        });
+    };
+    const schedulePull = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        pull();
+      }, 250);
+    };
+    pull();
+    const channel = subscribeToSyncChanges(client, userId, schedulePull);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      void client.removeChannel(channel);
+    };
+  }, [activeOwnerScope, loadCloudManually, online, supabaseConfigured]);
 
   const syncCloudManually = useCallback(async () => {
-    for (const timer of raceSaveTimersRef.current.values()) window.clearTimeout(timer);
-    for (const timer of ruleSaveTimersRef.current.values()) window.clearTimeout(timer);
-    raceSaveTimersRef.current.clear();
-    ruleSaveTimersRef.current.clear();
-    await Promise.allSettled(raceSaveChainsRef.current.values());
-    await ruleSaveChainRef.current.catch(() => undefined);
-    const client = getSupabaseClient();
-    const savedRuleByLocalId = new Map<string, PredictionRuleVersion>();
-    const orderedRules = [...rules].sort((a, b) => Number(a.isActive) - Number(b.isActive));
-    for (const rule of orderedRules) {
-      const saved = await saveRuleVersion(client, rule);
-      cloudRuleIdsRef.current.set(rule.id, saved.id);
-      cloudRuleIdsRef.current.set(saved.id, saved.id);
-      savedRuleByLocalId.set(rule.id, saved);
+    const database = localDatabaseRef.current;
+    const coordinator = syncCoordinatorRef.current;
+    if (!database || !coordinator || !cloudUserIdRef.current) {
+      throw new Error("Supabaseへログインしてから同期してください。");
     }
-    const savedRules = rules.map((rule) => savedRuleByLocalId.get(rule.id) ?? rule);
-    const savedRaces: RaceRecord[] = [];
-    const savedRaceIdByLocalId = new Map<string, string>();
-    const racesToSave = races.filter((race) =>
-      !DEMO_RACE_IDS.has(race.id) || dirtyRaceIdsRef.current.has(race.id),
+    const before = await listOutbox(database, ownerScopeRef.current);
+    await coordinator.flush("manual");
+    const afterIds = new Set(
+      (await listOutbox(database, ownerScopeRef.current)).map((item) => item.mutationId),
     );
-    for (const race of racesToSave) {
-      const localId = race.id;
-      const mappedId = cloudRaceIdsRef.current.get(localId);
-      const mappedRuleId = race.ruleVersion
-        ? cloudRuleIdsRef.current.get(race.ruleVersion.id)
-        : undefined;
-      const source = {
-        ...race,
-        ...(mappedId ? { id: mappedId } : {}),
-        ...(race.ruleVersion && mappedRuleId
-          ? { ruleVersion: { ...race.ruleVersion, id: mappedRuleId } }
-          : {}),
-      };
-      const saved = await saveRaceRecord(client, source);
-      cloudRaceIdsRef.current.set(localId, saved.id);
-      cloudRaceIdsRef.current.set(saved.id, saved.id);
-      savedRaceIdByLocalId.set(localId, saved.id);
-      savedRaces.push(saved);
-      clearRaceDirty(localId, saved.id);
+    const applied = before.filter((item) => !afterIds.has(item.mutationId));
+    await refreshSyncState();
+    return {
+      races: applied.filter((item) => item.entityType === "race").length,
+      rules: applied.filter((item) => item.entityType === "rule").length,
+    };
+  }, [refreshSyncState]);
+
+  const queueLocalMigration = useCallback(async ({
+    selectedRaces,
+    selectedRules,
+    selectedSettings,
+    backup,
+    planHash,
+    previewId,
+  }: {
+    selectedRaces: RaceRecord[];
+    selectedRules: PredictionRuleVersion[];
+    selectedSettings: UserSettings | null;
+    backup: LocalBackup;
+    planHash: string;
+    previewId: string;
+  }) => {
+    const userId = cloudUserIdRef.current;
+    const database = localDatabaseRef.current;
+    const coordinator = syncCoordinatorRef.current;
+    if (!userId || !database || !coordinator || !online) {
+      throw new Error("Supabaseへログインし、端末DBの準備後に移行してください。");
     }
-    setRaces(savedRaces);
-    setActiveRaceId((current) => (
-      savedRaceIdByLocalId.get(current) ??
-      (savedRaces.some((race) => race.id === current) ? current : (savedRaces[0]?.id ?? ""))
-    ));
-    if (savedRules.length) setRules(savedRules);
-    return { races: savedRaces.length, rules: savedRules.length };
-  }, [races, rules]);
+    assertNoDuplicateRaces(selectedRaces);
+    const ownerScope = ownerScopeForUser(userId);
+    const sourceScope = ownerScopeRef.current;
+    const authEpoch = authEpochRef.current;
+    const migrationController = new AbortController();
+    localMigrationAbortRef.current?.abort();
+    localMigrationAbortRef.current = migrationController;
+    const assertCurrentMigration = (expectedScope: OwnerScope = sourceScope) => {
+      const auth = syncAuthRef.current;
+      if (
+        migrationController.signal.aborted ||
+        authEpochRef.current !== authEpoch ||
+        cloudUserIdRef.current !== userId ||
+        auth.status !== "authenticated" ||
+        auth.userId !== userId ||
+        ownerScopeRef.current !== expectedScope
+      ) {
+        throw new Error("認証または作業領域が変わったため、ローカル移行を安全に中止しました。");
+      }
+    };
+    try {
+      assertCurrentMigration();
+    const previewEntry = cloudPreviewSnapshotsRef.current.get(previewId);
+    if (!previewEntry || previewEntry.userId !== userId) {
+      throw new Error("クラウド差分を再取得してから移行してください。");
+    }
+    const preview = previewEntry.bootstrap;
+    const fresh = await loadSyncBootstrap(
+      getSupabaseClient(),
+      migrationController.signal,
+    );
+    assertCurrentMigration();
+    const changedRace = selectedRaces.some((race) => {
+      const before = preview.races.find(
+        (candidate) => raceNaturalKey(candidate.value) === raceNaturalKey(race),
+      );
+      const current = fresh.races.find(
+        (candidate) => raceNaturalKey(candidate.value) === raceNaturalKey(race),
+      );
+      if (!before || !current) return before !== current;
+      return (
+        before.clientKey !== current.clientKey ||
+        before.version !== current.version ||
+        !sameJson(
+          migrationSemanticProjection(before.value),
+          migrationSemanticProjection(current.value),
+        )
+      );
+    });
+    const changedRule = selectedRules.some((rule) => {
+      const before = preview.rules.find(
+        (candidate) => ruleIdentityKey(candidate.value) === ruleIdentityKey(rule),
+      );
+      const current = fresh.rules.find(
+        (candidate) => ruleIdentityKey(candidate.value) === ruleIdentityKey(rule),
+      );
+      if (!before || !current) return before !== current;
+      return (
+        before.clientKey !== current.clientKey ||
+        before.version !== current.version ||
+        !sameJson(ruleSemanticValue(before.value), ruleSemanticValue(current.value))
+      );
+    });
+    const changedSettings = Boolean(
+      selectedSettings &&
+        ((preview.settings?.version ?? 0) !== (fresh.settings?.version ?? 0) ||
+          !sameJson(preview.settings?.value ?? null, fresh.settings?.value ?? null)),
+    );
+    if (changedRace || changedRule || changedSettings) {
+      cloudPreviewSnapshotsRef.current.delete(previewId);
+      throw new Error(
+        "プレビュー後にクラウド側が更新されました。上書きせず停止したため、差分を再取得してください。",
+      );
+    }
+    const raceInputs = selectedRaces.map((race) => {
+      const remote = preview.races.find(
+        (candidate) => raceNaturalKey(candidate.value) === raceNaturalKey(race),
+      );
+      const clientKey = remote?.clientKey ?? raceClientKey(race);
+      if (remote) cloudRaceAliasesRef.current.set(race.id, clientKey);
+      return {
+        race,
+        clientKey,
+        expectedVersion: remote?.version ?? 0,
+      };
+    });
+    const plannedRuleSetVersions = new Map<string, number>();
+    for (const remoteRule of preview.rules) {
+      if (remoteRule.parentVersion !== undefined) {
+        plannedRuleSetVersions.set(
+          ruleSetSyncKey(remoteRule.value),
+          remoteRule.parentVersion,
+        );
+      }
+    }
+    const ruleInputs = selectedRules.map((rule) => {
+      const remote = preview.rules.find(
+        (candidate) => ruleIdentityKey(candidate.value) === ruleIdentityKey(rule),
+      );
+      const remoteRuleSet = remote ?? preview.rules.find(
+        (candidate) => ruleSetSyncKey(candidate.value) === ruleSetSyncKey(rule),
+      );
+      const ruleSetKey = ruleSetSyncKey(rule);
+      const expectedRuleSetVersion =
+        plannedRuleSetVersions.get(ruleSetKey) ??
+        remoteRuleSet?.parentVersion ??
+        0;
+      plannedRuleSetVersions.set(
+        ruleSetKey,
+        expectedRuleSetVersion === 0 ? 1 : expectedRuleSetVersion + 1,
+      );
+      const clientKey = remote?.clientKey ?? rule.id;
+      if (remote) cloudRuleAliasesRef.current.set(rule.id, clientKey);
+      return {
+        rule,
+        clientKey,
+        expectedVersion: remote?.version ?? 0,
+        expectedRuleSetVersion,
+      };
+    });
+    const attemptKey = `${userId}:${backup.sha256}:${planHash}`;
+    const importKey = migrationAttemptKeysRef.current.get(attemptKey) ?? createMutationId();
+    migrationAttemptKeysRef.current.set(attemptKey, importKey);
+    assertCurrentMigration();
+    const result = await applyTrustedLocalMigration(getSupabaseClient(), {
+      importKey,
+      installationId: installationIdRef.current,
+      backupSha256: backup.sha256,
+      planHash,
+      races: raceInputs,
+      rules: ruleInputs,
+      signal: migrationController.signal,
+    });
+    assertCurrentMigration();
+    if (result.conflicts.length > 0) {
+      migrationAttemptKeysRef.current.delete(attemptKey);
+      throw new Error(
+        `移行中に${result.conflicts.length}件の競合が発生しました。` +
+        "クラウド差分を再取得し、端末版とクラウド版を比較してください。",
+      );
+    }
+    if (!result.completed) {
+      throw new Error("移行処理が完了していません。同じ画面から再試行してください。");
+    }
+    migrationAttemptKeysRef.current.delete(attemptKey);
+    await loadCloudManually();
+    assertCurrentMigration(ownerScope);
+
+    let settingsApplied = 0;
+    if (selectedSettings) {
+      const freshPreview = lastCloudBootstrapRef.current;
+      for (const localRule of backup.rules) {
+        const remoteRule = freshPreview?.rules.find(
+          (candidate) =>
+            ruleIdentityKey(candidate.value) === ruleIdentityKey(localRule),
+        );
+        if (remoteRule && remoteRule.clientKey !== localRule.id) {
+          cloudRuleAliasesRef.current.set(localRule.id, remoteRule.clientKey);
+        }
+      }
+      const migrationSettings = selectedSettings.activeRuleVersionId
+        ? {
+            ...selectedSettings,
+            activeRuleVersionId:
+              cloudRuleAliasesRef.current.get(selectedSettings.activeRuleVersionId) ??
+              selectedSettings.activeRuleVersionId,
+          }
+        : selectedSettings;
+      const mutation = createOutboxMutation({
+        ownerScope,
+        entityType: "settings",
+        entityKey: "profile",
+        payload: migrationSettings,
+        baseSnapshot: preview.settings?.value ?? null,
+        expectedVersion: preview.settings?.version ?? 0,
+      });
+      settingsRef.current = migrationSettings;
+      setSettings(migrationSettings);
+      await replaceWorkspace(database, {
+        ownerScope,
+        races: racesRef.current,
+        rules: rulesRef.current,
+        settings: {
+          activeRaceId: activeRaceIdRef.current,
+          userSettings: migrationSettings,
+          migrationBackupHash: backup.sha256,
+          cloudSync: {
+            versions: Object.fromEntries(cloudVersionsRef.current),
+            ruleSetVersions: Object.fromEntries(cloudRuleSetVersionsRef.current),
+            bases: Object.fromEntries(cloudBaseSnapshotsRef.current),
+          },
+        },
+        updatedAt: new Date().toISOString(),
+      }, [mutation]);
+      assertCurrentMigration(ownerScope);
+      await coordinator.flush("manual");
+      assertCurrentMigration(ownerScope);
+      const pending = await listOutbox(database, ownerScope);
+      assertCurrentMigration(ownerScope);
+      settingsApplied = pending.some((item) => item.mutationId === mutation.mutationId)
+        ? 0
+        : 1;
+    }
+    await refreshSyncState(ownerScope);
+    assertCurrentMigration(ownerScope);
+    cloudPreviewSnapshotsRef.current.delete(previewId);
+    return result.appliedCount + settingsApplied;
+    } finally {
+      if (localMigrationAbortRef.current === migrationController) {
+        localMigrationAbortRef.current = null;
+      }
+    }
+  }, [loadCloudManually, online, refreshSyncState]);
+
+  const assertConflictOwnerCurrent = useCallback((conflict: SyncConflict) => {
+    if (conflict.ownerScope !== ownerScopeRef.current) {
+      throw new Error("作業領域が変わったため、この競合操作を安全に中止しました。");
+    }
+    if (conflict.ownerScope.startsWith("user:")) {
+      const expectedUserId = conflict.ownerScope.slice("user:".length);
+      const auth = syncAuthRef.current;
+      if (auth.status !== "authenticated" || auth.userId !== expectedUserId) {
+        throw new Error("認証ユーザーが変わったため、この競合操作を安全に中止しました。");
+      }
+    }
+  }, []);
+
+  const markConflictResolved = useCallback(async (
+    conflict: SyncConflict,
+    resolution: NonNullable<SyncConflict["resolution"]>,
+    successor?: OutboxMutation,
+  ) => {
+    assertConflictOwnerCurrent(conflict);
+    const database = localDatabaseRef.current;
+    if (!database) return;
+    await resolveConflict(database, {
+      ...conflict,
+      status: "resolved",
+      resolution,
+      resolvedAt: new Date().toISOString(),
+    }, successor);
+    assertConflictOwnerCurrent(conflict);
+    await refreshSyncState(conflict.ownerScope);
+  }, [assertConflictOwnerCurrent, refreshSyncState]);
+
+  const applyResolvedRaceWorkspace = useCallback((
+    workspace: WorkspaceSnapshot,
+    entityKey: string,
+  ) => {
+    racesRef.current = workspace.races;
+    setRaces(workspace.races);
+    const activeRaceId = workspace.races.some(
+      (race) => race.id === activeRaceIdRef.current,
+    )
+      ? activeRaceIdRef.current
+      : (workspace.races[0]?.id ?? "");
+    activeRaceIdRef.current = activeRaceId;
+    setActiveRaceId(activeRaceId);
+
+    const rawCloudSync = workspace.settings.cloudSync;
+    const cloudSync =
+      rawCloudSync !== null && typeof rawCloudSync === "object"
+        ? rawCloudSync as Record<string, unknown>
+        : {};
+    const versions =
+      cloudSync.versions !== null && typeof cloudSync.versions === "object"
+        ? cloudSync.versions as Record<string, unknown>
+        : {};
+    const bases =
+      cloudSync.bases !== null && typeof cloudSync.bases === "object"
+        ? cloudSync.bases as Record<string, unknown>
+        : {};
+    const key = syncEntityKey("race", entityKey);
+    const version = versions[key];
+    if (typeof version === "number" && Number.isFinite(version)) {
+      cloudVersionsRef.current.set(key, version);
+    }
+    if (Object.hasOwn(bases, key)) {
+      cloudBaseSnapshotsRef.current.set(key, bases[key]);
+    }
+    const local = workspace.races.find(
+      (race) => race.clientKey === entityKey,
+    );
+    if (local && local.id !== entityKey) {
+      cloudRaceAliasesRef.current.set(local.id, entityKey);
+    }
+  }, []);
+
+  const useCloudConflictVersion = useCallback(async () => {
+    const conflict = syncConflicts[0];
+    if (!conflict) return;
+    assertConflictOwnerCurrent(conflict);
+    const database = localDatabaseRef.current;
+    if (!database) return;
+    if (conflict.entityType === "race") {
+      const [workspace, pending, cloudEnvelope] = await Promise.all([
+        getWorkspace(database, conflict.ownerScope),
+        listOutbox(database, conflict.ownerScope),
+        loadRaceSyncEnvelopeByClientKey(
+          getSupabaseClient(),
+          conflict.entityKey,
+        ),
+      ]);
+      assertConflictOwnerCurrent(conflict);
+      if (!workspace || !cloudEnvelope) {
+        throw new Error("競合解決に必要なレースを確認できないため安全に停止しました。");
+      }
+      const original = pending.find(
+        (mutation) => mutation.mutationId === conflict.mutationId,
+      );
+      if (!original) {
+        throw new Error("元のOutboxが見つからないため安全に停止しました。");
+      }
+      const prepared = prepareRaceConflictResolution({
+        workspace,
+        original,
+        conflict,
+        cloud: {
+          cloudId: cloudEnvelope.cloudId,
+          clientKey: cloudEnvelope.clientKey,
+          version: cloudEnvelope.version,
+          race: cloudEnvelope.race,
+        },
+        choice: "cloud",
+      });
+      const supersededMutationIds = pending
+        .filter((mutation) => {
+          const payload =
+            mutation.payload !== null && typeof mutation.payload === "object"
+              ? mutation.payload as Partial<RaceRecord>
+              : null;
+          return (
+            mutation.mutationId !== original.mutationId &&
+            Boolean(mutation.predecessorMutationId) &&
+            mutation.entityType === "race" &&
+            mutation.entityKey === original.entityKey &&
+            mutation.expectedVersion === cloudEnvelope.version &&
+            payload?.name === (original.payload as RaceRecord).name
+          );
+        })
+        .map((mutation) => mutation.mutationId);
+      await commitSyncResolution(database, {
+        workspace: prepared.workspace,
+        originalMutationId: original.mutationId,
+        entityType: "race",
+        entityKey: original.entityKey,
+        supersededMutationIds,
+        resolvedConflict: prepared.resolvedConflict,
+      });
+      assertConflictOwnerCurrent(conflict);
+      applyResolvedRaceWorkspace(prepared.workspace, original.entityKey);
+      await refreshSyncState(conflict.ownerScope);
+      setToast("クラウドのレース名と同期情報を採用しました。");
+      return;
+    }
+    const remote = conflict.remoteSnapshot;
+    const nextRaces = [...racesRef.current];
+    let nextRules = [...rulesRef.current];
+    let nextSettings = settingsRef.current;
+    const nextActiveRaceId = activeRaceIdRef.current;
+    if (conflict.entityType === "rule") {
+      const localId = [...cloudRuleAliasesRef.current.entries()].find(
+        ([, cloudId]) => cloudId === conflict.entityKey,
+      )?.[0] ?? conflict.entityKey;
+      if (remote === null) {
+        nextRules = nextRules.filter((rule) => rule.id !== localId);
+        if (nextSettings.activeRuleVersionId === localId) {
+          nextSettings = { ...nextSettings, activeRuleVersionId: null };
+        }
+      } else if (isRuleVersionArray([remote])) {
+        const remoteRule = remote as PredictionRuleVersion;
+        const found = nextRules.some((rule) => rule.id === localId);
+        nextRules = found
+          ? nextRules.map((rule) => rule.id === localId ? remoteRule : rule)
+          : [remoteRule, ...nextRules];
+        if (nextSettings.activeRuleVersionId === localId) {
+          nextSettings = { ...nextSettings, activeRuleVersionId: remoteRule.id };
+        }
+        cloudRuleAliasesRef.current.delete(localId);
+      } else {
+        throw new Error("クラウド側のルールデータを検証できませんでした。");
+      }
+    } else if (remote !== null && isUserSettings(remote)) {
+      nextSettings = remote;
+    } else if (remote === null) {
+      nextSettings = { ...DEFAULT_USER_SETTINGS };
+    } else {
+      throw new Error("クラウド側の設定データを検証できませんでした。");
+    }
+    const key = syncEntityKey(conflict.entityType, conflict.entityKey);
+    cloudVersionsRef.current.set(key, conflict.remoteVersion);
+    if (
+      conflict.entityType === "rule" &&
+      conflict.remoteParentVersion !== undefined
+    ) {
+      const versionedRule = isRuleVersionArray([remote])
+        ? remote as PredictionRuleVersion
+        : isRuleVersionArray([conflict.localSnapshot])
+          ? conflict.localSnapshot as PredictionRuleVersion
+          : null;
+      if (versionedRule) {
+        cloudRuleSetVersionsRef.current.set(
+          ruleSetSyncKey(versionedRule),
+          conflict.remoteParentVersion,
+        );
+      }
+    }
+    cloudBaseSnapshotsRef.current.set(key, remote);
+    racesRef.current = nextRaces;
+    rulesRef.current = nextRules;
+    settingsRef.current = nextSettings;
+    activeRaceIdRef.current = nextActiveRaceId;
+    setRaces(nextRaces);
+    setRules(nextRules);
+    setSettings(nextSettings);
+    setActiveRaceId(nextActiveRaceId);
+    await replaceWorkspace(database, {
+      ownerScope: conflict.ownerScope,
+      races: nextRaces,
+      rules: nextRules,
+      settings: {
+        activeRaceId: nextActiveRaceId,
+        userSettings: nextSettings,
+        cloudSync: {
+          versions: Object.fromEntries(cloudVersionsRef.current),
+          ruleSetVersions: Object.fromEntries(cloudRuleSetVersionsRef.current),
+          bases: Object.fromEntries(cloudBaseSnapshotsRef.current),
+        },
+      },
+      updatedAt: new Date().toISOString(),
+    });
+    await markConflictResolved(conflict, "remote");
+    setToast("クラウド版を採用しました");
+  }, [
+    applyResolvedRaceWorkspace,
+    assertConflictOwnerCurrent,
+    markConflictResolved,
+    refreshSyncState,
+    syncConflicts,
+  ]);
+
+  const resendLocalConflictVersion = useCallback(async () => {
+    const conflict = syncConflicts[0];
+    if (!conflict) return;
+    assertConflictOwnerCurrent(conflict);
+    const database = localDatabaseRef.current;
+    if (!database) return;
+    if (conflict.entityType === "race") {
+      const [workspace, pending, cloudEnvelope] = await Promise.all([
+        getWorkspace(database, conflict.ownerScope),
+        listOutbox(database, conflict.ownerScope),
+        loadRaceSyncEnvelopeByClientKey(
+          getSupabaseClient(),
+          conflict.entityKey,
+        ),
+      ]);
+      assertConflictOwnerCurrent(conflict);
+      if (!workspace || !cloudEnvelope) {
+        throw new Error("競合解決に必要なレースを確認できないため安全に停止しました。");
+      }
+      const original = pending.find(
+        (mutation) => mutation.mutationId === conflict.mutationId,
+      );
+      if (!original) {
+        throw new Error("元のOutboxが見つからないため安全に停止しました。");
+      }
+      const prepared = prepareRaceConflictResolution({
+        workspace,
+        original,
+        conflict,
+        cloud: {
+          cloudId: cloudEnvelope.cloudId,
+          clientKey: cloudEnvelope.clientKey,
+          version: cloudEnvelope.version,
+          race: cloudEnvelope.race,
+        },
+        choice: "local",
+      });
+      if (!prepared.successor) {
+        throw new Error("後続mutationを作成できないため安全に停止しました。");
+      }
+      const supersededMutationIds = pending
+        .filter((mutation) => {
+          const payload =
+            mutation.payload !== null && typeof mutation.payload === "object"
+              ? mutation.payload as Partial<RaceRecord>
+              : null;
+          return (
+            mutation.mutationId !== original.mutationId &&
+            Boolean(mutation.predecessorMutationId) &&
+            mutation.entityType === "race" &&
+            mutation.entityKey === original.entityKey &&
+            mutation.expectedVersion === cloudEnvelope.version &&
+            payload?.name === (original.payload as RaceRecord).name
+          );
+        })
+        .map((mutation) => mutation.mutationId);
+      await commitSyncResolution(database, {
+        workspace: prepared.workspace,
+        originalMutationId: original.mutationId,
+        entityType: "race",
+        entityKey: original.entityKey,
+        successor: prepared.successor,
+        supersededMutationIds,
+        resolvedConflict: prepared.resolvedConflict,
+      });
+      assertConflictOwnerCurrent(conflict);
+      applyResolvedRaceWorkspace(prepared.workspace, original.entityKey);
+      await refreshSyncState(conflict.ownerScope);
+      setToast("端末のレース名を維持し、後続mutationを作成しました。");
+      return;
+    }
+    const successor = createOutboxMutation({
+      ownerScope: conflict.ownerScope,
+      entityType: conflict.entityType,
+      entityKey: conflict.entityKey,
+      payload: conflict.localSnapshot,
+      baseSnapshot: conflict.remoteSnapshot,
+      expectedVersion: conflict.remoteVersion,
+      ...(conflict.remoteParentVersion === undefined
+        ? {}
+        : { expectedParentVersion: conflict.remoteParentVersion }),
+    });
+    await markConflictResolved(conflict, "local", successor);
+    await refreshSyncState(conflict.ownerScope);
+    setToast("端末版を維持し、後続mutationを作成しました。");
+  }, [
+    applyResolvedRaceWorkspace,
+    assertConflictOwnerCurrent,
+    markConflictResolved,
+    refreshSyncState,
+    syncConflicts,
+  ]);
+
+  const backupCurrentConflict = useCallback(async () => {
+    const database = localDatabaseRef.current;
+    const conflict = syncConflicts[0];
+    if (!database || !conflict) return;
+    assertConflictOwnerCurrent(conflict);
+    const backup = await exportSyncSafetyBackup(
+      database,
+      conflict.ownerScope,
+    );
+    const blob = new Blob([JSON.stringify(backup, null, 2)], {
+      type: "application/json;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    const timestamp = backup.createdAt.replaceAll(":", "-");
+    anchor.href = url;
+    anchor.download = `uma-note-outbox-safety-${timestamp}.uma-note.json`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    setToast(`Outbox原本 ${backup.outbox.length}件をバックアップしました。`);
+  }, [assertConflictOwnerCurrent, syncConflicts]);
+
+  const exportCurrentConflict = useCallback(() => {
+    const conflict = syncConflicts[0];
+    if (!conflict) return;
+    const blob = new Blob([JSON.stringify(conflict, null, 2)], {
+      type: "application/json;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `uma-note-conflict-${conflict.entityType}-${conflict.entityKey}.json`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  }, [syncConflicts]);
 
   function openRace(id: string) {
     setActiveRaceId(id);
@@ -714,9 +2172,23 @@ export function UmaNoteApp() {
   }
 
   function createRace() {
-    const race = makeBlankRace(activeRule);
+    const blank = makeBlankRace(activeRule, settings);
+    const usedKeys = new Set(racesRef.current.map(raceNaturalKey));
+    let raceNumber = blank.raceNumber;
+    while (
+      raceNumber <= 99 &&
+      usedKeys.has(raceNaturalKey({ ...blank, raceNumber }))
+    ) {
+      raceNumber += 1;
+    }
+    if (raceNumber > 99) {
+      setToast("同じ開催日のレース番号に空きがありません");
+      return;
+    }
+    const race = { ...blank, raceNumber };
     markRaceDirty(race.id);
-    setRaces((current) => [race, ...current]);
+    racesRef.current = [race, ...racesRef.current];
+    setRaces(racesRef.current);
     queueRaceCloudSave(race);
     setActiveRaceId(race.id);
     setView("race");
@@ -725,36 +2197,80 @@ export function UmaNoteApp() {
 
   function updateRace(updated: RaceRecord, message?: string) {
     const next = { ...updated, updatedAt: new Date().toISOString() };
-    markRaceDirty(next.id);
-    setRaces((current) =>
-      current.map((race) => (race.id === next.id ? next : race)),
+    const nextRaces = racesRef.current.map((race) =>
+      race.id === next.id ? next : race,
     );
+    try {
+      assertNoDuplicateRaces(nextRaces);
+    } catch (cause) {
+      setToast(cause instanceof Error ? cause.message : "同一レースが既に登録されています");
+      return;
+    }
+    markRaceDirty(next.id);
+    racesRef.current = nextRaces;
+    setRaces(nextRaces);
     queueRaceCloudSave(next);
     if (message) setToast(message);
   }
 
   function importRaces(imported: RaceRecord[]) {
-    const normalized = normalizeKnownDemoRaceScopes(imported, DEMO_RACE_IDS);
+    const normalized = upgradeLegacyPredictionLocks(
+      normalizeKnownDemoRaceScopes(
+        imported.map((race) => backfillRaceClientKey(race)),
+        DEMO_RACE_IDS,
+      ),
+    );
+    const importedIds = new Set(normalized.map((race) => race.id));
+    const combined = [
+      ...normalized,
+      ...racesRef.current.filter((race) => !importedIds.has(race.id)),
+    ];
+    assertNoDuplicateRaces(combined);
     for (const race of normalized) markRaceDirty(race.id);
-    setRaces((current) => {
-      const ids = new Set(normalized.map((race) => race.id));
-      return [...normalized, ...current.filter((race) => !ids.has(race.id))];
-    });
+    racesRef.current = combined;
+    setRaces(combined);
     for (const race of normalized) queueRaceCloudSave(race);
   }
 
   function activateRule(id: string) {
     const selected = rules.find((rule) => rule.id === id);
     if (!selected) return;
-    setRules((current) => current.map((rule) => ({ ...rule, isActive: rule.id === id })));
+    const nextRules = rulesRef.current.map((rule) => ({
+      ...rule,
+      isActive: rule.id === id,
+    }));
+    const nextSettings = { ...settingsRef.current, activeRuleVersionId: id };
+    rulesRef.current = nextRules;
+    settingsRef.current = nextSettings;
+    setRules(nextRules);
+    setSettings(nextSettings);
     queueRuleCloudAction({ ...selected, isActive: true }, "activate");
+    queueSettingsCloudSave(nextSettings, true);
     setToast("使用するルール版を切り替えました");
   }
 
   function createRule(rule: PredictionRuleVersion) {
-    setRules((current) => [rule, ...current.map((item) => ({ ...item, isActive: false }))]);
+    const nextRules = [
+      rule,
+      ...rulesRef.current.map((item) => ({ ...item, isActive: false })),
+    ];
+    const nextSettings = {
+      ...settingsRef.current,
+      activeRuleVersionId: rule.id,
+    };
+    rulesRef.current = nextRules;
+    settingsRef.current = nextSettings;
+    setRules(nextRules);
+    setSettings(nextSettings);
     queueRuleCloudAction(rule, "save");
+    queueSettingsCloudSave(nextSettings, true);
     setToast(`ルール v${rule.version} を作成しました`);
+  }
+
+  function updateUserSettings(nextSettings: UserSettings) {
+    settingsRef.current = nextSettings;
+    setSettings(nextSettings);
+    queueSettingsCloudSave(nextSettings);
   }
 
   const allSettlement = useMemo(
@@ -772,6 +2288,21 @@ export function UmaNoteApp() {
     (total, settlement) => total + settlement.payout,
     0,
   );
+  const cloudWorkspaceActive =
+    supabaseConfigured &&
+    cloudAuthStatus === "authenticated" &&
+    activeOwnerScope.startsWith("user:");
+  const connectionPresentation = connectionPresentationFor({
+    supabaseConfigured,
+    cloudAuthStatus,
+    userWorkspaceActive: cloudWorkspaceActive,
+    online,
+    pendingSyncCount,
+    conflictCount: syncConflicts.length,
+    syncPhase: syncStatus.phase,
+    cloudConnectionProbe,
+  });
+  const cloudTransportReady = connectionPresentation.ready;
 
   return (
     <div className="app-shell">
@@ -798,10 +2329,12 @@ export function UmaNoteApp() {
           ))}
         </nav>
         <div className="rail-status">
-          <span className={online ? "status-dot online" : "status-dot"} />
+          <span
+            className={connectionPresentation.ready ? "status-dot online" : "status-dot"}
+          />
           <div>
-            <strong>{online ? "オンライン" : "オフライン"}</strong>
-            <small>Supabase 同期対応</small>
+            <strong>{connectionPresentation.primary}</strong>
+            <small>{connectionPresentation.secondary}</small>
           </div>
         </div>
       </aside>
@@ -812,8 +2345,11 @@ export function UmaNoteApp() {
             <span className="brand-mark" aria-hidden="true">U</span>
             <span><strong>UMA NOTE</strong><small>予想と収支の記録</small></span>
           </button>
-          <span className={`connection-badge ${online ? "" : "offline"}`}>
-            {online ? (supabaseConfigured ? "SYNC" : "LOCAL") : "OFFLINE"}
+          <span
+            className={`connection-badge ${cloudTransportReady ? "" : "offline"}`}
+            title={connectionPresentation.secondary}
+          >
+            {connectionPresentation.badge}
           </span>
         </header>
 
@@ -830,6 +2366,7 @@ export function UmaNoteApp() {
         {view === "race" && activeRace && (
           <RaceWorkspace
             race={activeRace}
+            defaultStakePerPoint={settings.defaultStakePerPoint}
             onChange={updateRace}
             onBack={() => setView("home")}
           />
@@ -845,9 +2382,17 @@ export function UmaNoteApp() {
         {view === "settings" && (
           <SettingsView
             races={races}
+            rules={rules}
+            settings={settings}
+            activeRuleId={activeRule?.id ?? null}
+            pendingSyncCount={pendingSyncCount}
+            syncStatus={syncStatus}
+            onSettingsChange={updateUserSettings}
             onImportRaces={importRaces}
             onLoadFromCloud={loadCloudManually}
             onSyncToCloud={syncCloudManually}
+            onLoadCloudPreview={loadCloudPreview}
+            onQueueMigration={queueLocalMigration}
             onNotify={setToast}
           />
         )}
@@ -869,6 +2414,13 @@ export function UmaNoteApp() {
       </nav>
 
       {toast && <div className="toast" role="status">{toast}</div>}
+      <SyncConflictDialog
+        conflict={syncConflicts[0] ?? null}
+        onUseCloud={useCloudConflictVersion}
+        onUseLocal={resendLocalConflictVersion}
+        onBackup={backupCurrentConflict}
+        onExport={exportCurrentConflict}
+      />
     </div>
   );
 }
@@ -1013,10 +2565,12 @@ function RaceCard({ race, onOpen }: { race: RaceRecord; onOpen: () => void }) {
 
 function RaceWorkspace({
   race,
+  defaultStakePerPoint,
   onChange,
   onBack,
 }: {
   race: RaceRecord;
+  defaultStakePerPoint: number;
   onChange: (race: RaceRecord, message?: string) => void;
   onBack: () => void;
 }) {
@@ -1236,7 +2790,12 @@ function RaceWorkspace({
         />
       )}
       {stage === "bets" && (
-        <BetEditor race={race} locked={locked} onChange={onChange} />
+        <BetEditor
+          race={race}
+          locked={locked}
+          defaultStakePerPoint={defaultStakePerPoint}
+          onChange={onChange}
+        />
       )}
       {stage === "result" && (
         <ResultEditor race={race} onChange={onChange} />
@@ -1404,6 +2963,14 @@ function PredictionEditor({
           <div><strong>発走前予想は固定されています</strong><small>{race.lock.lockedAt ? `${new Date(race.lock.lockedAt).toLocaleString("ja-JP")} にロック` : "発走時刻を過ぎたため編集できません"}</small></div>
         </div>
       )}
+      {locked && race.lock.lockedSnapshot && (
+        <p className="subtle-note">
+          ロック時区分:{" "}
+          {RACE_DATA_SCOPE_LABELS[
+            race.lock.lockedSnapshot.race.dataScope ?? "live"
+          ]}
+        </p>
+      )}
 
       <div className="editor-columns">
         <div>
@@ -1476,10 +3043,12 @@ function PredictionEditor({
 function BetEditor({
   race,
   locked,
+  defaultStakePerPoint,
   onChange,
 }: {
   race: RaceRecord;
   locked: boolean;
+  defaultStakePerPoint: number;
   onChange: (race: RaceRecord, message?: string) => void;
 }) {
   const [kind, setKind] = useState<"proposal" | "actual">("proposal");
@@ -1534,6 +3103,7 @@ function BetEditor({
         </div>
         <BetBuilder
           disabled={editorDisabled}
+          defaultStakePerPoint={defaultStakePerPoint}
           onAdd={(plan) => setPlans([...plans, plan], `${BET_TYPE_LABELS[plan.betType]}の買い目を追加しました`)}
         />
       </div>
@@ -1553,15 +3123,17 @@ function describeSelection(plan: BetPlan): string {
 
 function BetBuilder({
   disabled,
+  defaultStakePerPoint,
   onAdd,
 }: {
   disabled: boolean;
+  defaultStakePerPoint: number;
   onAdd: (plan: BetPlan) => void;
 }) {
   const [betType, setBetType] = useState<BetType>("trio");
   const [method, setMethod] = useState<BetMethod>("formation");
   const [selectionText, setSelectionText] = useState("4 / 6,11 / 6,11,13");
-  const [stake, setStake] = useState(100);
+  const [stake, setStake] = useState(defaultStakePerPoint);
   const [memo, setMemo] = useState("");
   const [error, setError] = useState<string | null>(null);
   const effectiveMethod = normalizeBetMethod(betType, method);
@@ -1650,7 +3222,9 @@ function BetBuilder({
       <div className="two-fields">
         <Field label="1点金額">
           <select value={stake} disabled={disabled} onChange={(event) => setStake(Number(event.target.value))}>
-            {[100, 200, 300, 500, 1000, 2000].map((value) => <option key={value} value={value}>{yen(value)}</option>)}
+            {[...new Set([defaultStakePerPoint, 100, 200, 300, 500, 1000, 2000])]
+              .sort((left, right) => left - right)
+              .map((value) => <option key={value} value={value}>{yen(value)}</option>)}
           </select>
         </Field>
         <div className="builder-preview"><span>自動計算</span><strong>{preview.points}点</strong><strong>{yen(preview.investment)}</strong></div>
@@ -1952,15 +3526,43 @@ function RulesView({
 
 function SettingsView({
   races,
+  rules,
+  settings,
+  activeRuleId,
+  pendingSyncCount,
+  syncStatus,
+  onSettingsChange,
   onImportRaces,
   onLoadFromCloud,
   onSyncToCloud,
+  onLoadCloudPreview,
+  onQueueMigration,
   onNotify,
 }: {
   races: RaceRecord[];
+  rules: PredictionRuleVersion[];
+  settings: UserSettings;
+  activeRuleId: string | null;
+  pendingSyncCount: number;
+  syncStatus: SyncCoordinatorStatus;
+  onSettingsChange: (settings: UserSettings) => void;
   onImportRaces: (races: RaceRecord[]) => void;
   onLoadFromCloud: () => Promise<{ races: number; rules: number }>;
   onSyncToCloud: () => Promise<{ races: number; rules: number }>;
+  onLoadCloudPreview: () => Promise<{
+    previewId: string;
+    races: RaceRecord[];
+    rules: PredictionRuleVersion[];
+    settings: UserSettings | null;
+  }>;
+  onQueueMigration: (args: {
+    selectedRaces: RaceRecord[];
+    selectedRules: PredictionRuleVersion[];
+    selectedSettings: UserSettings | null;
+    backup: LocalBackup;
+    planHash: string;
+    previewId: string;
+  }) => Promise<number>;
   onNotify: (message: string) => void;
 }) {
   const [importText, setImportText] = useState("");
@@ -1968,6 +3570,8 @@ function SettingsView({
   const [exportPreview, setExportPreview] = useState("");
   const [exportError, setExportError] = useState<string | null>(null);
   const [email, setEmail] = useState("");
+  const [otpToken, setOtpToken] = useState("");
+  const [otpRequested, setOtpRequested] = useState(false);
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<"idle" | "working" | "error">("idle");
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
@@ -1985,31 +3589,52 @@ function SettingsView({
     return () => data.subscription.unsubscribe();
   }, [supabaseConfigured]);
 
-  async function sendMagicLink() {
+  async function sendOtp() {
     if (!email.trim()) {
       setConnectionMessage("メールアドレスを入力してください。");
       return;
     }
     setSyncState("working");
     try {
-      const client = getSupabaseClient();
-      const { error } = await client.auth.signInWithOtp({
-        email: email.trim(),
-        options: { emailRedirectTo: window.location.origin },
-      });
-      if (error) throw error;
-      setConnectionMessage("ログイン用リンクを送信しました。メールからこのアプリへ戻ってください。");
+      await requestEmailOtp(email);
+      setOtpRequested(true);
+      setOtpToken("");
+      setConnectionMessage("6桁の認証コードを送信しました。最新のコードを入力してください。");
       setSyncState("idle");
     } catch (cause) {
-      setConnectionMessage(cause instanceof Error ? cause.message : "ログインリンクを送信できませんでした。");
+      setConnectionMessage(cause instanceof Error ? cause.message : "認証コードを送信できませんでした。");
+      setSyncState("error");
+    }
+  }
+
+  async function verifyOtp() {
+    setSyncState("working");
+    try {
+      const session = await verifyEmailOtp(email, otpToken);
+      setUserEmail(session.user.email ?? email.trim());
+      setOtpToken("");
+      setOtpRequested(false);
+      setConnectionMessage("認証が完了しました。クラウド同期を利用できます。");
+      setSyncState("idle");
+    } catch (cause) {
+      setConnectionMessage(cause instanceof Error ? cause.message : "認証コードを確認できませんでした。");
       setSyncState("error");
     }
   }
 
   async function signOut() {
-    const client = getSupabaseClient();
-    await client.auth.signOut();
-    setConnectionMessage("ログアウトしました。端末上の表示データはそのままです。");
+    setSyncState("working");
+    try {
+      await signOutFromCloud();
+      setUserEmail(null);
+      setOtpToken("");
+      setOtpRequested(false);
+      setConnectionMessage("ログアウトしました。端末上の表示データはそのままです。");
+      setSyncState("idle");
+    } catch {
+      setConnectionMessage("ログアウトできませんでした。通信状態を確認してください。");
+      setSyncState("error");
+    }
   }
 
   async function loadFromCloud() {
@@ -2127,13 +3752,41 @@ function SettingsView({
           <div className="settings-icon" aria-hidden="true">DB</div>
           <div><p className="eyebrow dark">SUPABASE</p><h2>クラウド同期</h2><p>端末へ常時自動保存し、ログイン中はPostgreSQLへも変更を自動保存します。</p></div>
           <span className={`connection-state ${supabaseConfigured ? "ready" : ""}`}>{supabaseConfigured ? "接続設定済み" : "環境変数が未設定"}</span>
-          <div className="config-list"><span>NEXT_PUBLIC_SUPABASE_URL <b>{supabaseConfigured ? "設定済み" : "未設定"}</b></span><span>NEXT_PUBLIC_SUPABASE_ANON_KEY <b>{supabaseConfigured ? "設定済み" : "未設定"}</b></span></div>
+          <div className="config-list"><span>NEXT_PUBLIC_SUPABASE_URL <b>{supabaseConfigured ? "設定済み" : "未設定"}</b></span><span>公開キー（publishable / anon） <b>{supabaseConfigured ? "設定済み" : "未設定"}</b></span></div>
           {supabaseConfigured && !userEmail && (
             <div className="auth-panel">
               <Field label="同期に使うメールアドレス">
-                <input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" />
+                <input type="email" autoComplete="email" value={email} readOnly={otpRequested} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" />
               </Field>
-              <button className="primary-button full" type="button" disabled={syncState === "working"} onClick={sendMagicLink}>メールでログイン</button>
+              <button className="primary-button full" type="button" disabled={syncState === "working"} onClick={sendOtp}>
+                {otpRequested ? "認証コードを再送" : "認証コードを送信"}
+              </button>
+              {otpRequested && (
+                <>
+                  <Field label="6桁の認証コード">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      pattern="[0-9]{6}"
+                      maxLength={6}
+                      value={otpToken}
+                      onChange={(event) =>
+                        setOtpToken(event.target.value.replace(/\D/g, "").slice(0, 6))
+                      }
+                      placeholder="6桁の数字"
+                    />
+                  </Field>
+                  <button
+                    className="secondary-button full"
+                    type="button"
+                    disabled={syncState === "working" || otpToken.length !== 6}
+                    onClick={verifyOtp}
+                  >
+                    コードを確認
+                  </button>
+                </>
+              )}
             </div>
           )}
           {supabaseConfigured && userEmail && (
@@ -2147,14 +3800,76 @@ function SettingsView({
             </div>
           )}
           {connectionMessage && <p className={syncState === "error" ? "form-error" : "connection-message"} role="status">{connectionMessage}</p>}
+          <p className="security-note">
+            Outbox {pendingSyncCount}件 · 同期状態 {supabaseConfigured
+              ? userEmail
+                ? syncStatus.phase
+                : "停止（未認証）"
+              : "停止（LOCAL）"}
+          </p>
           <p className="security-note">秘密鍵（service_role）はブラウザに設定しません。行レベルセキュリティで本人のデータだけにアクセスします。</p>
+        </section>
+
+        <CloudMigrationPanel
+          races={races}
+          rules={rules}
+          settings={settings}
+          activeRuleId={activeRuleId}
+          userEmail={userEmail}
+          onLoadCloudPreview={onLoadCloudPreview}
+          onQueueMigration={onQueueMigration}
+          onNotify={onNotify}
+        />
+
+        <section className="settings-card preferences-card">
+          <div className="settings-icon" aria-hidden="true">⚙</div>
+          <div>
+            <p className="eyebrow dark">USER SETTINGS</p>
+            <h2>予想入力の初期値</h2>
+            <p>クラウド利用時は本人の設定として端末間で同期します。</p>
+          </div>
+          <div className="two-fields">
+            <Field label="既定の1点金額">
+              <input
+                type="number"
+                min={100}
+                step={100}
+                value={settings.defaultStakePerPoint}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  if (Number.isInteger(value) && value >= 100) {
+                    onSettingsChange({
+                      ...settings,
+                      defaultStakePerPoint: value,
+                    });
+                  }
+                }}
+              />
+            </Field>
+            <Field label="新規レースの区分">
+              <select
+                value={settings.defaultDataScope}
+                onChange={(event) =>
+                  onSettingsChange({
+                    ...settings,
+                    defaultDataScope: event.target.value as RaceDataScope,
+                  })
+                }
+              >
+                <option value="live">実収支</option>
+                <option value="demo">デモ</option>
+                <option value="test">テスト</option>
+              </select>
+            </Field>
+          </div>
+          <p className="security-note">タイムゾーンは競馬開催時刻に合わせて Asia/Tokyo で固定します。</p>
         </section>
 
         <section className="settings-card">
           <div className="settings-icon" aria-hidden="true">PWA</div>
           <div><p className="eyebrow dark">INSTALLABLE</p><h2>スマートフォンへ追加</h2><p>ブラウザの「ホーム画面に追加」から、アプリのように起動できます。</p></div>
           <ul className="check-list"><li>レスポンシブ表示</li><li>アプリマニフェスト</li><li>静的画面のオフラインキャッシュ</li></ul>
-          <p className="security-note">初回オンライン表示後は、端末保存データをオフラインでも開けます。通信断中の変更は、再接続後に全件同期または再編集してクラウド保存してください。</p>
+          <p className="security-note">初回オンライン表示後は、端末保存データをオフラインでも開けます。通信断中の変更はOutboxへ保持し、ログイン済みのアプリを開いた状態で再接続すると自動同期します。</p>
         </section>
 
         <section className="settings-card import-export-card">

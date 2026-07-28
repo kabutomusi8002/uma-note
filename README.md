@@ -24,14 +24,14 @@
 |買い目|単勝、馬連、ワイド、3連複、3連単|
 |買い方|通常、BOX、フォーメーション。重複を除外して点数を展開|
 |金額|点数、1点金額、合計投資額を自動計算|
-|ロック|発走前の明示ロック、発走時刻後のDB強制ロック、変更履歴|
+|ロック|発走前の明示ロック、発走時刻後のDB強制ロック、変更履歴、予想・予想買い目・使用ルールの独立スナップショット|
 |券面分離|予想案 `proposal` と実購入 `actual` を別管理|
 |結果|着順、100円あたり払戻、暫定／公式確定、実投資、払戻、収支、回収率|
 |収支区分|`live`（実収支）、`demo`、`test`を分離。デモ／テストは累計・レース別収支・反省傾向から除外|
 |反省|展開、馬場、軸、相手、買い目、資金、判断、その他に分類|
 |交換|バージョン付き `---RACE---` 形式の複数レース入出力|
 |ルール|予想ルールの版管理、使用版のスナップショット|
-|保存・同期|端末へ自動保存。メールリンク認証中はレース／ルールをSupabaseへ自動保存し、手動同期も可能|
+|保存・同期|LOCALモード、永続Outbox、再接続同期、メールリンク認証、端末間競合の比較・明示解決|
 |PWA|ホーム画面追加、スタンドアロン表示、アプリシェルと静的資産のオフラインキャッシュ|
 
 ## 画面構成
@@ -73,7 +73,7 @@ Windows PowerShellの場合：
 Copy-Item .env.example .env.local
 ```
 
-Supabaseをまだ接続しない場合は `.env.local` なしでも起動できます。レースとルールはブラウザの端末領域へ自動保存されるため、再読み込み後も続けられます。Supabaseを設定してログインすると、編集したレースとルール版をクラウドへも自動保存します。未編集のサンプルデータは自動送信されません。初期サンプルは `demo`、動作確認用レースは画面から `test` に設定でき、どちらも実収支集計へ含まれません。
+`.env.example` の接続値は空なので、そのまま複製してもLOCALモードになります。`.env.local` 自体を作らなくても起動できます。レース、ルール、設定は端末へ保存され、再読み込みやオフライン起動後も続けられます。Supabaseを設定してログインした場合も、編集はまず端末へ確定し、永続Outboxからクラウドへ送信します。未編集のサンプルデータは自動送信されません。初期サンプルは `demo`、動作確認用レースは `test` に設定でき、どちらも実収支集計へ含まれません。
 
 ### 3. 開発サーバーを起動
 
@@ -91,13 +91,13 @@ Supabaseで新しいプロジェクトを作成し、Project SettingsのAPI欄�
 
 ```dotenv
 NEXT_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon-or-publishable-key>
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<sb_publishable_...>
 NEXT_PUBLIC_SITE_URL=https://<your-production-domain>
 ```
 
-`NEXT_PUBLIC_SITE_URL`は公開時のOG画像URL用です。ローカルだけなら省略できます。
+`NEXT_PUBLIC_SITE_URL`は公開時のメタデータとPKCE認証コールバックURLの基準です。ローカル開発では`http://127.0.0.1:4173`、本番では公開先のHTTPS originを設定してください。
 
-`SUPABASE_SERVICE_ROLE_KEY` はブラウザ用ではありません。必要な場合もサーバーまたは管理作業だけに使い、`NEXT_PUBLIC_*` を付けないでください。
+旧プロジェクトでは `NEXT_PUBLIC_SUPABASE_ANON_KEY` も使用できます。`service_role`、`sb_secret_*`、DBパスワード、接続文字列はブラウザ用ではなく、このアプリのクライアントコードから参照しません。管理作業はSupabase CLIまたはDashboardの保護された設定で行ってください。
 
 ### 2. PostgreSQLスキーマを適用
 
@@ -120,28 +120,90 @@ SQL Editorを使う場合は、次の順に実行します。
 
 1. `supabase/migrations/0001_initial_schema.sql`
 2. `supabase/migrations/0002_race_data_scope.sql`
-3. `supabase/seed.sql`
+3. `supabase/migrations/0003_cloud_tenancy.sql`
+4. `supabase/migrations/0004_cloud_sync_protocol.sql`
+5. `supabase/migrations/0005_locked_snapshot_and_local_migration.sql`
+6. `supabase/migrations/0006_pre_remote_hardening.sql`
+7. `supabase/migrations/0007_race_client_key_insert_fix.sql`
+8. `supabase/seed.sql`
 
 マイグレーションには、テーブル、制約、インデックス、変更履歴トリガー、発走時刻ロック、集計ビュー、JSON保存RPC、RLSポリシーが含まれます。
 
-### 3. メールリンク認証を設定
+### 3. メールOTP認証を設定
 
 Supabase AuthenticationのURL Configurationで、以下を登録します。
 
-- Site URL：公開先URL。開発時だけなら表示されたLocal URL
-- Redirect URLs：Local URLと本番URLを両方追加
+- Site URL：公開先URL。ローカル開発では`http://127.0.0.1:4173`
+- Redirect URLs：`http://127.0.0.1:4173/auth/callback`
+- 本番のRedirect URL：`https://<your-production-domain>/auth/callback`
 
-アプリの「設定」→「クラウド同期」でメールアドレスを入力します。受信したリンクから戻ると、保存済みデータを自動読込し、その後の変更を約700msの間隔で自動保存します。「クラウドから読込」と「Supabaseへ同期」は、明示的に再読込／全件同期したい場合に使えます。
+通常ログインはメールで届く6桁OTPを使用します。アプリの「設定」→「クラウド同期」でメールアドレスを入力して「認証コードを送信」を押し、届いた6桁コードを入力して「コードを確認」を押します。認証に成功するとSupabaseクライアントがセッションを永続化し、ページを再読み込みしてもログイン状態を復元します。ログアウトは同じ画面の「ログアウト」を使用します。別ユーザーへ切り替える場合は、現在の同期状態とOutbox所有者を確認してからログアウトし、切替先の正しいメールアドレスで改めてOTP認証します。
+
+`/auth/callback`のPKCE処理は、旧版との互換性および既に送信済みのMagic Linkを完了するために残しています。Magic Link経由では、認証を開始した同じ端末・ブラウザでリンクを開き、callbackが一時コードを既存Supabaseクライアントのセッションへ交換してからURLからコードを除去します。現在の通常UIはMagic Linkではなく6桁OTPを送信します。期限切れ、使用済み、不正なコードは再利用せず、新しい認証コードを要求してください。初回ログインだけでは端末データを送信せず、完全バックアップとクラウド差分のプレビュー後に移行対象を確定します。
+
+通常編集は端末へ即時保存され、認証済みかつオンラインのときだけOutboxが送信されます。オフライン、通信失敗、トークン更新中でも変更は残り、再接続・画面復帰・手動再試行で同期を再開します。同期中にログアウトまたは別ユーザーへ切り替わった場合は進行中の要求を中断し、元ユーザーのOutboxをそのユーザー領域へ残します。別端末の更新はRLS付き`sync_change_log`のRealtime通知をきっかけに再取得しますが、通知自体を正本にはせず、version付きRPCの結果だけを採用します。migrationは、Supabase管理publicationが存在する場合だけこのchange logを自動追加します。
+
+レースの`client_key`は作成時に一度だけ生成し、端末内レース、RACE/1バックアップ、Outbox payloadと`entityKey`へ保存します。リトライやアプリ再起動では同じ値を再利用します。旧版の未送信Outboxにキーがない場合は、保存済みOutboxの`entityKey`（なければ旧レースID）を一度だけ補完して端末DBへ再保存し、新しいランダム値は作りません。DB側も初回INSERT時点で`client_key`を必須にし、同じmutationの再送を二重登録せず、同じキーに別内容をcreateしようとした場合は競合として扱います。
+
+初回移行画面は、バックアップ時点のレース・ルール・設定をクラウド値と比較します。レースは`live/demo/test`を保ったまま個別選択し、同名同版で内容の異なる不変ルール、設定の差、ロック済みレースは明示的な選択が終わるまで送信しません。発走後に初めて同期される未ロック予想は編集用の`client_record`として保持し、不変の発走前証跡には昇格しません。オフラインで発走前に明示ロックし、発走後に初めて同期した場合は、クライアント時刻由来であることを示す別の不変証跡へ保存します。`v0.1.1-local-clean`時代のロック済みレースは、当時固定されていた予想・予想買い目・ルールから`legacy_local_upgrade`証跡をバックアップ内に再構成してから、プレビュー付き専用移行を使用します。
+
+### クラウド同期運用ランブック
+
+#### owner-mismatchとユーザー切替
+
+- `owner-mismatch`が発生した場合は、同期、client keyの補完、Outbox削除、再送を強行しません。現在のログイン主体とOutbox所有者が一致するか確認し、不一致のOutboxは元ユーザーの監査履歴として保持します。
+- ユーザーを切り替える場合は、進行中の同期が停止していることを確認し、ログアウト後に切替先の正しいメールアドレスでOTP認証します。別ユーザーのOutboxを現在のセッションへ付け替えません。
+- 秘密値、メールアドレス、OTP、認証トークン、Outbox payloadなどの個人情報を、画面共有、アプリログ、README、障害報告へ残しません。
+
+#### data scopeとローカル本移行
+
+- `test`と`demo`は`live`収支へ含めません。確認用データを安易に`live`へ変更せず、元の区分を保ったまま監査・エクスポートします。
+- ローカル本移行の前に`UMA_NOTE_BACKUP/1`形式の完全バックアップを取得し、checksum、移行preview、自然キーとclient keyの重複判定、バックアップからの復元可能性を確認します。
+- previewの対象件数、除外件数、競合内容、ログイン主体を確認し、本移行は利用者の明示承認後にだけ実施します。ログインやバックアップ作成だけでは移行を開始しません。
+
+#### version競合とverified rebase
+
+- version競合では既存mutationを無言で再送せず、クラウドUUID、current version、mutation receipt、change logを確認してからverified rebaseを使用します。
+- 既存mutation IDを別内容で再利用しません。端末版を採用する場合は、確認済みcurrent versionを`expected_version`に設定した新しいmutation IDの後続mutationを1件だけ作成します。
+- UUID／version保存または後続mutation作成に失敗した場合は、元Outboxを未解決のまま保持して安全停止します。receipt確認前に処理済み扱いや物理削除をしません。
+
+#### SMTP障害
+
+- OTP送信に失敗した場合は、Auth APIのHTTP statusと安全なerror code、SMTP認証結果、メール送信レート制限を確認します。メールアドレスや認証情報そのものは記録しません。
+- SMTP設定では、Host、587/TLS、SMTP Login、API keyではなくSMTP Keyを使用していること、検証済み送信者との完全一致、OTPテンプレートのHTMLと変数、provider側への要求到達を確認します。
+- service_role、Supabase secret、SMTP Key、DBパスワードをブラウザへ渡したり、通常運用の障害調査で使用したりしません。
+
+#### testユーザーと診断行
+
+- testユーザー／test行は、診断run識別子、作成日、所有者区分、`data_scope=test`を基準に管理し、live集計と明確に分離します。
+- 整理する場合は各所有者の認証済み権限で自分のtest行だけを対象にします。所有者未確定行を管理者権限で探索・変更せず、service_roleによる一括操作は通常運用では行いません。
+
+#### 期限付き依存リスク記録（再確認期限: 2026-08-04）
+
+- Next.js本体と`eslint-config-next`は16.2.12へ更新済みです。
+- Next.js経由のPostCSSとSharpについては、npm auditのHigh警告が残る可能性があります。これは警告を無視してよいという意味ではなく、期限付きで到達性と互換性を管理する記録です。
+- 現在のVinext production bundleには該当するNext.js／PostCSS／Sharpのruntime経路がありません。ユーザー入力CSSをPostCSSで処理せず、ユーザー提供画像をSharpへ渡しません。
+- `next/image`、Server Actions、middleware認証、ユーザー入力を外部ホスト名へ組み込む動的rewritesを使用しません。
+- インターネット公開前に依存ツリーとproduction auditを再監査し、警告を解消します。前項の機能を新たに追加した場合は、このリスク受容を直ちに無効化して公開を停止します。
+- Sharpの強制overrideは、Vinext、Next.js、Cloudflare／Miniflareの画像経路との互換性を確認せずに行いません。
 
 ### セキュリティ
 
-- アプリデータは `auth.uid()` 単位のRLSで分離
-- 統合RPCは `security invoker` でRLSを迂回しない
+- 共有マスター以外の全ユーザーデータ行に `user_id` を保持
+- 全テーブルでRLSを有効化し、`user_id = (select auth.uid())` の本人だけを許可
+- 集約配下の直接書き込みを禁止し、競合検査・冪等receipt付きRPCだけを許可
+- 公開RPCは認証を必須とし、内部helperの実行権限は`public`/`authenticated`から剥奪
+- 全集計ビューは `security_invoker = true`
 - 予想変更履歴は利用者が更新・削除できない
-- ロック後または発走時刻後の予想変更はDBでも拒否
+- ロック証跡は別テーブルの不変スナップショットとして更新・削除を拒否。ロック後の通常予想は別の現在値として同期され、証跡を変更しない
+- canonicalロック証跡にはロック時点の`data_scope`を固定し、scopeを含むJSON全体をSHA-256で検証。後からレース区分を変更しても証跡側は変えない
+- オフライン明示ロックは発走前に再接続した場合も、旧版再構成ロックと同様にサーバー時刻の証明と混同しないsource付き別テーブルへ保存
 - 予想案と実購入は `bet_slips.kind` で分離
 - 暫定結果は公式結果へ自動昇格せず、「結果を確定」した場合だけ累計収支へ反映
 - `races.data_scope = 'live'` のレースだけを収支ビューへ含め、デモ／テストの払戻を実績から除外
+- ルール版と親ルールセットの`sync_version`を別々に比較し、どちらかの不一致も書き込まず端末版とクラウド版を比較画面へ送る
+- 成功・競合のどちらもmutation receiptへ保存し、同じmutation IDの再送で二重反映や結果のすり替わりを防止
+- mutation IDと安定client keyで再送・二重クリック・途中再開による重複を防止
 
 ## `---RACE---` 形式
 
@@ -162,6 +224,8 @@ START_TIME: "15:25"
 
 自由記述や入れ子データは、改行・区切り文字で壊れないようJSON値として表現します。未知の版、必須項目欠落、不正な券種や金額は保存前に拒否します。完全な仕様は `lib/race-format.ts` の `RACE_FORMAT_SPECIFICATION` にあります。
 
+クラウド移行前の完全バックアップには `UMA_NOTE_BACKUP/1` を使用します。内部にRACE/1本文を保持し、レースに未適用のルール、使用中ルール、ユーザー設定も一緒に保存します。所有者ID、クラウドUUID、認証トークン、Outbox内部情報は書き出しません。
+
 ## 品質確認
 
 ```bash
@@ -181,6 +245,13 @@ npm run build
 - `---RACE---` の往復変換、複数ブロック、壊れた入力
 - UIモデルとSupabase RPC JSON間の変換
 - DBロック回避、馬名保持、暫定結果、ルール版IDの回帰テスト
+- LOCALモード、旧localStorage移行、IndexedDBとOutboxの原子的保存
+- オフライン再送、mutation冪等性、二端末version競合、3-way比較
+- 全ユーザーテーブルのuser_id/RLS、別ユーザー拒否、秘密情報の非公開
+- バックアップ、移行プレビュー、自然キー重複、再開receipt
+- DB正規形のロックスナップショットをクライアント形式へ戻す往復変換
+- `v0.1.1-local-clean`の旧ロックをsource付き完全snapshotへ昇格する互換テスト
+- ルール／設定だけの移行確認、Realtime再取得、競合解決と再送予約の原子的保存
 
 ## 本番ビルドと公開
 
@@ -197,15 +268,15 @@ Cloudflare Workersへ公開する場合は、初回だけ `npx wrangler login` �
 npx vinext deploy
 ```
 
-`vinext deploy` は本番ビルドとWorkersへのデプロイをまとめて実行します。Supabaseを使う公開版では、実行前に `NEXT_PUBLIC_SUPABASE_URL`、`NEXT_PUBLIC_SUPABASE_ANON_KEY`、`NEXT_PUBLIC_SITE_URL` をビルド環境へ設定してください。
+`vinext deploy` は本番ビルドとWorkersへのデプロイをまとめて実行します。Supabaseを使う公開版では、実行前に `NEXT_PUBLIC_SUPABASE_URL`、`NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`、`NEXT_PUBLIC_SITE_URL` をビルド環境へ設定してください。
 
-PWAのService Workerは本番ビルドでだけ登録します。初回オンライン表示後はアプリシェルとビルド済み資産をキャッシュし、端末に自動保存した入力をオフラインでも開けます。通信断中の変更は端末に残るため、再接続後に手動同期するか、対象を再編集してクラウド保存を再試行してください。Service Worker変更時はキャッシュ版を更新します。
+PWAのService Workerは本番ビルドでだけ登録します。初回オンライン表示後はアプリシェルとビルド済み資産をキャッシュし、端末に保存した入力をオフラインでも開けます。通信断中の変更はOutboxに残り、再接続後のアプリ表示中に自動同期します。認証トークンをService Workerへ渡すバックグラウンド同期は行いません。
 
 ## ディレクトリ
 
 ```text
 app/                       画面、PWA manifest、Service Worker登録
-lib/                       型、計算、RACE形式、Supabaseアダプタ
+lib/                       型、計算、RACE形式、端末DB、同期エンジン、Supabaseアダプタ
 public/                    PWAアイコン、Service Worker
 supabase/migrations/       PostgreSQLマイグレーション
 supabase/seed.sql          競馬場・反省カテゴリの共有マスター

@@ -31,15 +31,15 @@ export const RACE_BLOCK_END = "---END RACE---";
  * Every value after `KEY:` is a JSON literal on one line. That keeps strings,
  * newlines and Japanese text lossless while remaining easy to read and edit.
  * Blank lines and lines beginning with `#` are ignored. Keys are fixed,
- * case-sensitive and may appear only once. DATA_SCOPE, STATUS and ENTRIES are optional
- * RACE/1 extensions so documents written before those fields existed remain
- * importable.
+ * case-sensitive and may appear only once. CLIENT_KEY, DATA_SCOPE, STATUS and
+ * ENTRIES are optional RACE/1 extensions so documents written before those
+ * fields existed remain importable.
  */
 export const RACE_FORMAT_SPECIFICATION = `RACE/1 (UTF-8)
 各レースは ${RACE_BLOCK_START} と ${RACE_BLOCK_END} で囲みます。
 各項目は KEY: JSON値 の1行形式です。空行と # から始まるコメントは無視されます。
-キーは大文字・固定で、DATA_SCOPE、STATUS、ENTRIES 以外は必須です。
-DATA_SCOPE、STATUS、ENTRIES、および LOCK 内の postTimeLockedAt は任意です。
+キーは大文字・固定で、CLIENT_KEY、DATA_SCOPE、STATUS、ENTRIES 以外は必須です。
+CLIENT_KEY、DATA_SCOPE、STATUS、ENTRIES、および LOCK 内の postTimeLockedAt は任意です。
 文字列はJSON文字列としてダブルクォートで囲みます。`;
 
 const REQUIRED_FIELD_KEYS = [
@@ -61,7 +61,12 @@ const REQUIRED_FIELD_KEYS = [
   "UPDATED_AT",
 ] as const;
 
-const OPTIONAL_FIELD_KEYS = ["DATA_SCOPE", "STATUS", "ENTRIES"] as const;
+const OPTIONAL_FIELD_KEYS = [
+  "CLIENT_KEY",
+  "DATA_SCOPE",
+  "STATUS",
+  "ENTRIES",
+] as const;
 const FIELD_KEYS = [...REQUIRED_FIELD_KEYS, ...OPTIONAL_FIELD_KEYS] as const;
 
 type RequiredFieldKey = (typeof REQUIRED_FIELD_KEYS)[number];
@@ -403,6 +408,106 @@ export function validateRaceRecord(value: unknown): RaceRecord {
     ? undefined
     : timestampAt(lock.postTimeLockedAt, "race.lock.postTimeLockedAt");
 
+  let lockedSnapshot: RaceRecord["lock"]["lockedSnapshot"];
+  if (lock.lockedSnapshot !== undefined) {
+    if (!isLocked || lockedAt === null) {
+      throw new RaceFormatError(
+        "race.lock.lockedSnapshot は明示ロック済みレースだけに保存できます",
+      );
+    }
+    const snapshot = objectAt(
+      lock.lockedSnapshot,
+      "race.lock.lockedSnapshot",
+    );
+    const snapshotRace = objectAt(
+      snapshot.race,
+      "race.lock.lockedSnapshot.race",
+    );
+    const snapshotLockedAt = timestampAt(
+      snapshot.lockedAt,
+      "race.lock.lockedSnapshot.lockedAt",
+    );
+    if (snapshotLockedAt !== lockedAt) {
+      throw new RaceFormatError(
+        "race.lock.lockedSnapshot.lockedAt は lock.lockedAt と一致する必要があります",
+      );
+    }
+    const snapshotBets = arrayAt(
+      snapshot.proposedBets,
+      "race.lock.lockedSnapshot.proposedBets",
+    ).map((plan, index) =>
+      validateBetPlan(
+        plan,
+        `race.lock.lockedSnapshot.proposedBets[${index}]`,
+      ),
+    );
+    lockedSnapshot = {
+      schemaVersion: integerAt(
+        snapshot.schemaVersion,
+        "race.lock.lockedSnapshot.schemaVersion",
+        1,
+        1,
+      ) as 1,
+      ...(snapshot.provenance === undefined
+        ? {}
+        : {
+            provenance: enumAt(
+              snapshot.provenance,
+              ["explicit_lock", "legacy_local_upgrade"] as const,
+              "race.lock.lockedSnapshot.provenance",
+            ),
+          }),
+      race: {
+        id: stringAt(snapshotRace.id, "race.lock.lockedSnapshot.race.id"),
+        ...(snapshotRace.dataScope === undefined
+          ? {}
+          : {
+              dataScope: enumAt(
+                snapshotRace.dataScope,
+                RACE_DATA_SCOPES,
+                "race.lock.lockedSnapshot.race.dataScope",
+              ),
+            }),
+        date: isoDateAt(
+          snapshotRace.date,
+          "race.lock.lockedSnapshot.race.date",
+        ),
+        course: stringAt(
+          snapshotRace.course,
+          "race.lock.lockedSnapshot.race.course",
+        ),
+        raceNumber: integerAt(
+          snapshotRace.raceNumber,
+          "race.lock.lockedSnapshot.race.raceNumber",
+          1,
+          12,
+        ),
+        startTime: startTimeAt(
+          snapshotRace.startTime,
+          "race.lock.lockedSnapshot.race.startTime",
+        ),
+        name: stringAt(
+          snapshotRace.name,
+          "race.lock.lockedSnapshot.race.name",
+          true,
+        ),
+      },
+      prediction: validatePrediction(
+        snapshot.prediction,
+        "race.lock.lockedSnapshot.prediction",
+      ),
+      proposedBets: snapshotBets,
+      ruleVersion:
+        snapshot.ruleVersion === null
+          ? null
+          : validateRuleVersion(
+              snapshot.ruleVersion,
+              "race.lock.lockedSnapshot.ruleVersion",
+            ),
+      lockedAt: snapshotLockedAt,
+    };
+  }
+
   const revisions = arrayAt(lock.revisions, "race.lock.revisions").map(
     (item, index) => {
       const revisionPath = `race.lock.revisions[${index}]`;
@@ -553,8 +658,18 @@ export function validateRaceRecord(value: unknown): RaceRecord {
     };
   }
 
+  const id = stringAt(race.id, "race.id");
+  const clientKey = stringAt(
+    race.clientKey ?? race.id,
+    race.clientKey === undefined ? "race.id" : "race.clientKey",
+  ).trim();
+  if (clientKey.length > 160) {
+    throw new RaceFormatError("race.clientKey は160文字以内である必要があります");
+  }
+
   return {
-    id: stringAt(race.id, "race.id"),
+    id,
+    clientKey,
     ...(dataScope === undefined ? {} : { dataScope }),
     ...(status === undefined ? {} : { status }),
     date: isoDateAt(race.date, "race.date"),
@@ -570,6 +685,7 @@ export function validateRaceRecord(value: unknown): RaceRecord {
       isLocked,
       lockedAt,
       ...(postTimeLockedAt === undefined ? {} : { postTimeLockedAt }),
+      ...(lockedSnapshot === undefined ? {} : { lockedSnapshot }),
       revisions,
     },
     result,
@@ -587,6 +703,7 @@ function fieldValues(race: RaceRecord): FieldValues {
   return {
     FORMAT_VERSION: RACE_FORMAT_VERSION,
     ID: race.id,
+    CLIENT_KEY: race.clientKey,
     ...(race.dataScope === undefined ? {} : { DATA_SCOPE: race.dataScope }),
     DATE: race.date,
     COURSE: race.course,
@@ -628,11 +745,18 @@ export function exportRaces(races: readonly RaceRecord[]): string {
   }
   const normalized = races.map((race) => validateRaceRecord(race));
   const raceIds = new Set<string>();
+  const clientKeys = new Set<string>();
   for (const race of normalized) {
     if (raceIds.has(race.id)) {
       throw new RaceFormatError(`レースID ${race.id} が重複しています`);
     }
+    if (clientKeys.has(race.clientKey)) {
+      throw new RaceFormatError(
+        `CLIENT_KEY ${race.clientKey} が重複しています`,
+      );
+    }
     raceIds.add(race.id);
+    clientKeys.add(race.clientKey);
   }
   return normalized.map(exportNormalizedRace).join("\n\n");
 }
@@ -671,6 +795,9 @@ function parseFieldLine(
 function recordFromFields(fields: ReadonlyMap<FieldKey, unknown>): unknown {
   return {
     id: fields.get("ID"),
+    ...(fields.has("CLIENT_KEY")
+      ? { clientKey: fields.get("CLIENT_KEY") }
+      : {}),
     ...(fields.has("DATA_SCOPE") ? { dataScope: fields.get("DATA_SCOPE") } : {}),
     ...(fields.has("STATUS") ? { status: fields.get("STATUS") } : {}),
     date: fields.get("DATE"),
@@ -698,6 +825,7 @@ export function parseRaces(text: string): RaceRecord[] {
   const lines = text.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").split("\n");
   const races: RaceRecord[] = [];
   const raceIds = new Set<string>();
+  const clientKeys = new Set<string>();
   let index = 0;
 
   while (index < lines.length) {
@@ -756,7 +884,13 @@ export function parseRaces(text: string): RaceRecord[] {
       if (raceIds.has(race.id)) {
         throw new RaceFormatError(`レースID ${race.id} が重複しています`);
       }
+      if (clientKeys.has(race.clientKey)) {
+        throw new RaceFormatError(
+          `CLIENT_KEY ${race.clientKey} が重複しています`,
+        );
+      }
       raceIds.add(race.id);
+      clientKeys.add(race.clientKey);
       races.push(race);
     } catch (error) {
       if (error instanceof RaceFormatError) {

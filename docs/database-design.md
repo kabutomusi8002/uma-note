@@ -101,7 +101,7 @@ DBビューが次を提供する。
 - `racecourses`と`reflection_categories`は認証済みユーザーが読み取り可能な共有マスター。
 - それ以外は開催の`owner_id = auth.uid()`を起点に所有者を検証する。
 - 子テーブルへ別ユーザーのIDを差し込めないよう、RLSに加えて整合性トリガーでも同一レースを検証する。
-- 統合RPCは`security invoker`で実行し、RLSを迂回しない。
+- 既存の通常CRUDは`security invoker`とRLSを使用する。version付き同期RPCは集約を原子的に更新するため`security definer`とし、固定`search_path`、`auth.uid()`、所有者複合FK、入力hashを検証したうえで、内部helperの実行権限を一般ロールから剥奪する。
 - 未認証（`anon`）にはアプリテーブル/RPCの権限を与えない。
 
 ## JSON RPC
@@ -110,13 +110,14 @@ DBビューが次を提供する。
 
 - `get_race_records()`：自分のレースを発走時刻降順のJSON配列で取得
 - `get_race_record(p_race_id)`：1レースを入れ子JSONで取得
-- `upsert_race_record(payload)`：1レース分を1トランザクションで保存
+- `sync_race_record(payload, expected_version, mutation_id, installation_id)`：安定した`client_key`とCASを使って1レース分を冪等保存
 - `lock_prediction(p_prediction_id)`：予想をロック
 
-最小の`upsert_race_record`入力例：
+`upsert_race_record(payload)`は`sync_race_record`からだけ呼ばれる内部集約writerであり、`public`、`anon`、`authenticated`からの直接実行権限は剥奪する。最小のレースpayload例：
 
 ```json
 {
+  "client_key": "race-client-generated-once",
   "meeting": {
     "meeting_date": "2026-07-18",
     "meeting_number": 1,
@@ -151,7 +152,7 @@ DBビューが次を提供する。
 }
 ```
 
-既存レースの更新時は最上位の`id`へレースUUIDを指定する。買い目は`first_horse_number`、`second_horse_number`、`third_horse_number`の代わりに`selections: [1, 2, 3]`も使用できる。`upsert_race_record`はRLS対象であり、他ユーザーのUUIDを渡すと「存在しない/アクセス不可」として失敗する。
+`client_key`はレース作成時に端末で一度だけ生成し、Outboxの再送・再起動・オフライン復帰でも変更しない。新規INSERTでは`user_id`と`client_key`を同時に書き込み、後段UPDATEでキーを付け替えない。既存レースは`client_key`と`expected_version`で解決し、サーバーのレースUUIDをクライアント同期IDとして使用しない。買い目は`first_horse_number`、`second_horse_number`、`third_horse_number`の代わりに`selections: [1, 2, 3]`も使用できる。
 
 ## `---RACE---`形式
 
@@ -161,6 +162,7 @@ DBビューが次を提供する。
 ---RACE---
 FORMAT_VERSION: 1
 ID: "race-id"
+CLIENT_KEY: "race-client-generated-once"
 DATE: "2026-07-18"
 COURSE: "東京"
 RACE_NUMBER: 11
@@ -178,7 +180,7 @@ UPDATED_AT: "2026-07-17T12:00:00.000Z"
 ---END RACE---
 ```
 
-UIで`lib/race-format.ts`により形式・必須キー・値を検証し、RaceRecordからDB用JSONへ変換した後に`upsert_race_record`を呼ぶ。エクスポートもUIでDB用JSONをRaceRecordへ戻してからRACE/1へ変換する。DB独自の交換形式は持たない。`race_exchange_documents`は、必要に応じて元文書、方向、処理状態を監査保存するためのテーブルである。
+UIで`lib/race-format.ts`により形式・必須キー・値を検証し、RaceRecordからDB用JSONへ変換した後にversion付き`sync_race_record`を呼ぶ。`CLIENT_KEY`は後方互換の任意項目で、旧RACE/1文書では`ID`を安定キーとして補完する。エクスポートもUIでDB用JSONをRaceRecordへ戻してからRACE/1へ変換する。DB独自の交換形式は持たない。`race_exchange_documents`は、必要に応じて元文書、方向、処理状態を監査保存するためのテーブルである。
 
 ## 適用
 
@@ -195,4 +197,22 @@ supabase link --project-ref <project-ref>
 supabase db push
 ```
 
-マイグレーションは`supabase/migrations/0001_initial_schema.sql`、共有マスターは`supabase/seed.sql`にある。
+マイグレーションは`supabase/migrations/0001_initial_schema.sql`から`supabase/migrations/0007_race_client_key_insert_fix.sql`までを番号順に適用し、共有マスターは`supabase/seed.sql`から投入する。
+
+## クラウド同期プロトコル
+
+既存の`0001`と`0002`は変更せず、`0003_cloud_tenancy.sql`以降を前進適用する。`racecourses`と`reflection_categories`は共有マスターであり、それ以外のユーザーデータ行は直接`user_id`を持つ。親子関係には`(user_id, id)`の複合外部キーを設定し、別ユーザーの親IDを子行へ差し込めない構造にする。
+
+全テーブルでRLSを有効化する。ユーザーテーブルの基本条件は`user_id = (select auth.uid())`、共有マスターは`authenticated`の読み取りだけである。集約配下の直接INSERT／UPDATE／DELETEは取り消し、公開RPCからだけ更新する。権限昇格する内部helperは一般ロールから実行権限を剥奪し、公開RPCでは`auth.uid()`、固定`search_path`、入力hashを検証する。
+
+レース、ルール、設定には単調増加する`sync_version`を持たせる。更新RPCは`expected_version`と`mutation_id`を必須とし、version不一致時は何も更新せず現在のクラウド値を返す。同じmutation IDと同じpayload hashの再送は保存済みresponseを返し、異なるpayloadでのmutation ID再利用は拒否する。
+
+`0007_race_client_key_insert_fix.sql`は、`races.client_key`を初回INSERTの列リストへ直接含める。`client_key`のNULL・空白・160文字超を拒否し、`(user_id, client_key)`の一意制約とキー変更拒否triggerを維持する。同じmutationの再送はreceiptから再生し、別mutationで同じキーをcreateしようとした場合はversion conflict、同じ自然キーを別キーで作成しようとした場合はnatural-key conflictとして返す。
+
+`sync_change_log`はユーザー別の差分cursorを提供し、Realtime通知は差分取得のきっかけにだけ使用する。削除を実装する場合はroot集約のtombstoneをchange logへ記録し、端末側の古いキャッシュを復活させない。
+
+明示ロック時は`prediction_locked_snapshots`へ、レース識別、発走時刻、予想、選出馬、危険人気、穴馬、ルールsnapshot、proposal券面を正規化して保存する。実購入、結果、払戻、反省はロック後も更新できるため含めない。snapshot行はhash付きでUPDATE／DELETE禁止とする。
+
+端末移行は`local_migration_documents`と`local_migration_items`へdocument hash、record hash、対象ID、期待version、状態を保存する。通常の`race_exchange_documents`とは分離し、成功済み項目を再登録せず同じ端末から再開できる。
+
+発走時刻後に初めて届いた通常Outboxの未ロック予想は、正規化された予想行を新規作成せず、所有者検証済み`races.client_record`の現在メモとして保持するため、`prediction_locked_snapshots`は作らない。オフライン中に発走前の明示ロックを完了していた場合だけ、完全snapshot・ロック時刻・レース識別を検証し、`offline_prediction_locked_snapshots`へクライアント時刻由来のsource付き証跡として追記する。`v0.1.1-local-clean`の旧ロックは、旧UIで固定済みだった予想・proposal券面・ルールから`legacy_local_upgrade`として再構成する。どちらもUPDATE／DELETEを禁止し、サーバー上で発走前に実行した`lock_rpc`証跡とは区別する。

@@ -109,11 +109,31 @@ export interface PredictionRevision {
   snapshot: RacePrediction;
 }
 
+/**
+ * Complete, immutable proof of what was decided before post time.
+ * Actual purchases and results deliberately remain outside this snapshot.
+ */
+export interface PredictionLockedSnapshot {
+  schemaVersion: 1;
+  /** How this client snapshot was produced; absent on older/cloud canonical rows. */
+  provenance?: "explicit_lock" | "legacy_local_upgrade";
+  race: Pick<
+    RaceRecord,
+    "id" | "date" | "course" | "raceNumber" | "startTime" | "name" | "dataScope"
+  >;
+  prediction: RacePrediction;
+  proposedBets: BetPlan[];
+  ruleVersion: PredictionRuleVersion | null;
+  lockedAt: string;
+}
+
 export interface PredictionLock {
   isLocked: boolean;
   lockedAt: string | null;
   /** Persisted client-side boundary once the scheduled post time is reached. */
   postTimeLockedAt?: string;
+  /** Stored separately from the editable/current race aggregate. */
+  lockedSnapshot?: PredictionLockedSnapshot;
   revisions: PredictionRevision[];
 }
 
@@ -198,6 +218,20 @@ export interface PredictionRuleVersion {
   isActive: boolean;
 }
 
+export interface UserSettings {
+  timezone: "Asia/Tokyo";
+  defaultStakePerPoint: number;
+  defaultDataScope: RaceDataScope;
+  activeRuleVersionId: string | null;
+}
+
+export const DEFAULT_USER_SETTINGS: Readonly<UserSettings> = {
+  timezone: "Asia/Tokyo",
+  defaultStakePerPoint: 100,
+  defaultDataScope: "live",
+  activeRuleVersionId: null,
+};
+
 /**
  * One self-contained race record.
  *
@@ -207,6 +241,17 @@ export interface PredictionRuleVersion {
  */
 export interface RaceRecord {
   id: string;
+  /** PostgreSQL UUID assigned to this race after the first successful cloud sync. */
+  cloudId?: string;
+  /** Last cloud sync_version durably acknowledged by this local workspace. */
+  syncVersion?: number;
+  /**
+   * Immutable client-generated identity used by the cloud sync protocol.
+   *
+   * This is deliberately separate from the PostgreSQL race UUID and from the
+   * mutable date/course/race-number natural identity.
+   */
+  clientKey: string;
   /**
    * Controls whether this record contributes to bankroll/performance totals.
    * Older records without this field are treated as `live`.
