@@ -1,20 +1,21 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-const tenancy = readFileSync(
+function readNormalizedSql(url: URL): string {
+  return readFileSync(url, "utf8").replace(/\r\n?/g, "\n");
+}
+
+const tenancy = readNormalizedSql(
   new URL("../supabase/migrations/0003_cloud_tenancy.sql", import.meta.url),
-  "utf8",
 );
-const protocol = readFileSync(
+const protocol = readNormalizedSql(
   new URL("../supabase/migrations/0004_cloud_sync_protocol.sql", import.meta.url),
-  "utf8",
 );
-const lockedMigration = readFileSync(
+const lockedMigration = readNormalizedSql(
   new URL(
     "../supabase/migrations/0005_locked_snapshot_and_local_migration.sql",
     import.meta.url,
   ),
-  "utf8",
 );
 
 function between(source: string, start: string, end: string): string {

@@ -1,13 +1,15 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-const schema = readFileSync(
+function readNormalizedSql(url: URL): string {
+  return readFileSync(url, "utf8").replace(/\r\n?/g, "\n");
+}
+
+const schema = readNormalizedSql(
   new URL("../supabase/migrations/0001_initial_schema.sql", import.meta.url),
-  "utf8",
 );
-const dataScopeMigration = readFileSync(
+const dataScopeMigration = readNormalizedSql(
   new URL("../supabase/migrations/0002_race_data_scope.sql", import.meta.url),
-  "utf8",
 );
 
 describe("database lock safety", () => {

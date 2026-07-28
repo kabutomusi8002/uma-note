@@ -1,0 +1,8 @@
+.gitattributes text eol=lf
+supabase/migrations/*.sql text eol=lf
+supabase/tests/*.sql text eol=lf
+.github/workflows/*.yml text eol=lf
+.github/workflows/*.yaml text eol=lf
+*.sh text eol=lf
+*.mjs text eol=lf
+*.toml text eol=lf
