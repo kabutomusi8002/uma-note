@@ -8,12 +8,20 @@ const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
 
 const { d1, r2 } = hostingConfig;
 
+export const workerObservabilityConfig = {
+  enabled: true,
+  logs: {
+    invocation_logs: false,
+  },
+} as const;
+
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 
-const localBindingConfig = {
+export const workerDeploymentConfig = {
   main: "./worker/index.ts",
   compatibility_flags: ["nodejs_compat"],
+  observability: workerObservabilityConfig,
   d1_databases: d1
     ? [
         {
@@ -52,7 +60,7 @@ export default defineConfig(async () => {
       sites(),
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
-        config: localBindingConfig,
+        config: workerDeploymentConfig,
       }),
     ],
   };
