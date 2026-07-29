@@ -11,7 +11,6 @@ export const metadata: Metadata = {
   },
   description:
     "予想を組み立て、発走前に固定し、実購入・結果・反省まで一つにつなぐ競馬ノートPWA。",
-  manifest: "/manifest.webmanifest",
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
@@ -61,6 +60,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="ja">
+      <head>
+        <link rel="manifest" href="/manifest.webmanifest" />
+      </head>
       <body>
         {children}
         <ServiceWorkerRegister />
