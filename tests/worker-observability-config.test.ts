@@ -17,7 +17,8 @@ describe("Cloudflare Worker observability configuration", () => {
     );
   });
 
-  it("does not change workers.dev routing from source configuration", () => {
-    expect(workerDeploymentConfig).not.toHaveProperty("workers_dev");
+  it("keeps the production workers.dev route disabled while allowing previews", () => {
+    expect(workerDeploymentConfig.workers_dev).toBe(false);
+    expect(workerDeploymentConfig.preview_urls).toBe(true);
   });
 });
