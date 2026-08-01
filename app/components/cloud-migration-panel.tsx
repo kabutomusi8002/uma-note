@@ -37,7 +37,9 @@ export interface CloudMigrationPanelProps {
   settings: UserSettings;
   activeRuleId: string | null;
   userEmail: string | null;
-  onLoadCloudPreview: () => Promise<CloudMigrationPreview>;
+  onLoadCloudPreview: (
+    dataScopes: readonly RaceDataScope[],
+  ) => Promise<CloudMigrationPreview>;
   onQueueMigration: (args: {
     selectedRaces: RaceRecord[];
     selectedRules: PredictionRuleVersion[];
@@ -313,12 +315,16 @@ export function CloudMigrationPanel({
     }
   };
 
-  const loadPreview = async () => {
+  const loadPreview = async (
+    previewScopes: MigrationScopeSelection = scopes,
+  ) => {
     if (!backup) return;
     setBusy("preview");
     setError("");
     try {
-      const remote = await onLoadCloudPreview();
+      const selectedScopes = (Object.keys(previewScopes) as RaceDataScope[])
+        .filter((scope) => previewScopes[scope]);
+      const remote = await onLoadCloudPreview(selectedScopes);
       setCloudRaces(remote.races);
       setCloudRules(remote.rules);
       setCloudSettings(remote.settings);
@@ -332,7 +338,7 @@ export function CloudMigrationPanel({
       setRuleConflictResolutions({});
       const nextSettingsAction = settingsAction(backupSettings(backup), remote.settings);
       setSettingsResolution(nextSettingsAction === "create" ? "replace-local" : null);
-      await rebuildPlan(scopes, remote.races);
+      await rebuildPlan(previewScopes, remote.races);
       onNotify("移行プレビューを更新しました。まだクラウドへは送信していません。");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "クラウドのプレビューを取得できませんでした。");
@@ -346,14 +352,7 @@ export function CloudMigrationPanel({
     setScopes(nextScopes);
     setError("");
     if (!cloudRaces || !backup) return;
-    setBusy("preview");
-    try {
-      await rebuildPlan(nextScopes, cloudRaces);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "プレビューを更新できませんでした。");
-    } finally {
-      setBusy(null);
-    }
+    await loadPreview(nextScopes);
   };
 
   const toggleCreate = (sourceId: string, checked: boolean) => {

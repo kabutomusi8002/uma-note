@@ -7,6 +7,7 @@ import {
   loadSyncChanges,
 } from "../lib/supabase/sync-repository";
 import { DEFAULT_USER_SETTINGS } from "../lib/types";
+import { buildMigrationPlan } from "../lib/sync/migration-plan";
 import { createOutboxMutation } from "../lib/sync/outbox";
 import { pushOutboxMutation } from "../lib/sync/supabase-adapter";
 
@@ -468,6 +469,231 @@ describe("Supabase Outbox adapter", () => {
       value: { activeRuleVersionId: rule.id },
     });
     expect(bootstrap.latestChangeSequence).toBe(21);
+  });
+
+  it("previews live races when an unselected test race has an invalid race number", async () => {
+    const live = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const invalidTest = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "invalid-test-race",
+      clientKey: "invalid-test-race",
+      dataScope: "test" as const,
+      raceNumber: 91,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const { client } = clientWithResponse({
+      races: [raceToDatabasePayload(live), raceToDatabasePayload(invalidTest)],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    const bootstrap = await loadSyncBootstrap(client, undefined, ["live"]);
+    const plan = await buildMigrationPlan({
+      localRaces: [live],
+      cloudRaces: bootstrap.races.map((record) => record.value),
+      includeScopes: { live: true, demo: false, test: false },
+    });
+
+    expect(bootstrap.races).toHaveLength(1);
+    expect(bootstrap.races[0]?.value.dataScope).toBe("live");
+    expect(plan.items).toHaveLength(1);
+  });
+
+  it("keeps validating an invalid test race when test is selected", async () => {
+    const invalidTest = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "invalid-test-race",
+      clientKey: "invalid-test-race",
+      dataScope: "test" as const,
+      raceNumber: 91,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const { client } = clientWithResponse({
+      races: [raceToDatabasePayload(invalidTest)],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    const bootstrap = await loadSyncBootstrap(client, undefined, ["test"]);
+
+    await expect(buildMigrationPlan({
+      localRaces: [],
+      cloudRaces: bootstrap.races.map((record) => record.value),
+      includeScopes: { live: false, demo: false, test: true },
+    })).rejects.toThrow("raceNumber must be an integer from 1 to 12");
+  });
+
+  it("ignores invalid demo and test races when neither scope is selected", async () => {
+    const live = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const invalidScopes = (["demo", "test"] as const).map((dataScope, index) => ({
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "invalid-" + dataScope + "-race",
+      clientKey: "invalid-" + dataScope + "-race",
+      dataScope,
+      raceNumber: 91 + index,
+      proposedBets: [],
+      purchasedBets: [],
+    }));
+    const { client } = clientWithResponse({
+      races: [
+        raceToDatabasePayload(live),
+        ...invalidScopes.map(raceToDatabasePayload),
+      ],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    const bootstrap = await loadSyncBootstrap(client, undefined, ["live"]);
+
+    await expect(buildMigrationPlan({
+      localRaces: [live],
+      cloudRaces: bootstrap.races.map((record) => record.value),
+      includeScopes: { live: true, demo: false, test: false },
+    })).resolves.toMatchObject({ counts: { excluded: 0 } });
+  });
+
+  it("keeps live filtering while rule and settings migrate in separate attempts", async () => {
+    const live = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const invalidTest = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "invalid-test-race",
+      clientKey: "invalid-test-race",
+      dataScope: "test" as const,
+      raceNumber: 91,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const rule = structuredClone(DEMO_RULE_VERSION);
+    const settings = {
+      ...DEFAULT_USER_SETTINGS,
+      activeRuleVersionId: rule.id,
+    };
+    const ruleRecord = {
+      id: "55555555-5555-4555-8555-555555555555",
+      client_key: rule.id,
+      sync_version: 1,
+      semantic_version: rule.version,
+      content: rule.rules.join("\n"),
+      parameters: { display_name: rule.name, rules: rule.rules },
+      rule_set: {
+        id: "66666666-6666-4666-8666-666666666666",
+        name: rule.name,
+        is_active: true,
+        sync_version: 1,
+      },
+      created_at: rule.createdAt,
+    };
+    let cloudRule: typeof ruleRecord | null = null;
+    let cloudSettings: Record<string, unknown> | null = null;
+    const rpc = vi.fn(async (name: string) => {
+      if (name === "get_sync_bootstrap") {
+        return {
+          data: {
+            races: [raceToDatabasePayload(live), raceToDatabasePayload(invalidTest)],
+            rules: cloudRule ? [cloudRule] : [],
+            settings: cloudSettings,
+            latest_change_seq: cloudSettings ? 3 : cloudRule ? 2 : 1,
+          },
+          error: null,
+        };
+      }
+      if (name === "sync_rule_version") {
+        cloudRule = ruleRecord;
+        return {
+          data: {
+            status: "applied",
+            record: ruleRecord,
+            version: 1,
+            rule_set_version: 1,
+            change_seq: 2,
+          },
+          error: null,
+        };
+      }
+      if (name === "sync_user_settings") {
+        cloudSettings = {
+          user_id: "44444444-4444-4444-8444-444444444444",
+          active_rule_version_id: ruleRecord.id,
+          preferences: settings,
+          sync_version: 1,
+        };
+        return {
+          data: {
+            status: "applied",
+            record: cloudSettings,
+            version: 1,
+            change_seq: 3,
+          },
+          error: null,
+        };
+      }
+      throw new Error("Unexpected RPC: " + name);
+    });
+    const client = { rpc } as unknown as SupabaseClient;
+
+    const initial = await loadSyncBootstrap(client, undefined, ["live"]);
+    const plannedCount = 1 + (initial.settings ? 0 : 1);
+    expect(initial.races).toHaveLength(1);
+    expect(initial.rules).toHaveLength(0);
+    expect(initial.settings).toBeNull();
+    expect(plannedCount).toBe(2);
+
+    const ruleMutation = createOutboxMutation(
+      {
+        ownerScope: "user:44444444-4444-4444-8444-444444444444",
+        entityType: "rule",
+        entityKey: rule.id,
+        payload: rule,
+        expectedVersion: 0,
+      },
+      { randomUUID: () => MUTATION_ID },
+    );
+    await expect(
+      pushOutboxMutation(client, ruleMutation, INSTALLATION_ID),
+    ).resolves.toMatchObject({ status: "applied" });
+
+    const afterRule = await loadSyncBootstrap(client, undefined, ["live"]);
+    expect(afterRule.races).toHaveLength(1);
+    expect(afterRule.rules).toHaveLength(1);
+    expect(afterRule.settings).toBeNull();
+
+    const settingsMutation = createOutboxMutation(
+      {
+        ownerScope: "user:44444444-4444-4444-8444-444444444444",
+        entityType: "settings",
+        entityKey: "profile",
+        payload: settings,
+        expectedVersion: 0,
+      },
+      { randomUUID: () => "33333333-3333-4333-8333-333333333333" },
+    );
+    await expect(
+      pushOutboxMutation(client, settingsMutation, INSTALLATION_ID),
+    ).resolves.toMatchObject({ status: "applied" });
+
+    const afterSettings = await loadSyncBootstrap(client, undefined, ["live"]);
+    expect(afterSettings.races).toHaveLength(1);
+    expect(afterSettings.settings?.value.activeRuleVersionId).toBe(rule.id);
   });
 
   it("uses the database get_sync_changes parameter contract", async () => {

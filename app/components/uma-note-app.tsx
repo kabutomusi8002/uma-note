@@ -461,7 +461,11 @@ export function UmaNoteApp() {
   const lastCloudBootstrapRef = useRef<SyncBootstrap | null>(null);
   const cloudPreviewSnapshotsRef = useRef(new Map<
     string,
-    { userId: string; bootstrap: SyncBootstrap }
+    {
+      userId: string;
+      bootstrap: SyncBootstrap;
+      dataScopes?: readonly RaceDataScope[];
+    }
   >());
   const cloudVersionsRef = useRef(new Map<string, number>());
   const cloudRuleSetVersionsRef = useRef(new Map<string, number>());
@@ -1138,7 +1142,9 @@ export function UmaNoteApp() {
     ));
   }, [enqueueDurableMutation]);
 
-  const loadCloudPreview = useCallback(async () => {
+  const loadCloudPreview = useCallback(async (
+    dataScopes?: readonly RaceDataScope[],
+  ) => {
     const userId = cloudUserIdRef.current;
     if (!supabaseConfigured || !userId) {
       throw new Error("Supabaseへログインしてからプレビューしてください。");
@@ -1149,7 +1155,11 @@ export function UmaNoteApp() {
     setCloudConnectionProbe("checking");
     let bootstrap: SyncBootstrap;
     try {
-      bootstrap = await loadSyncBootstrap(getSupabaseClient());
+      bootstrap = await loadSyncBootstrap(
+        getSupabaseClient(),
+        undefined,
+        dataScopes,
+      );
     } catch (cause) {
       if (
         authEpochRef.current === authEpoch &&
@@ -1172,6 +1182,7 @@ export function UmaNoteApp() {
     cloudPreviewSnapshotsRef.current.set(previewId, {
       userId,
       bootstrap: structuredClone(bootstrap),
+      ...(dataScopes ? { dataScopes: [...dataScopes] } : {}),
     });
     while (cloudPreviewSnapshotsRef.current.size > 5) {
       const oldest = cloudPreviewSnapshotsRef.current.keys().next().value as
@@ -1189,7 +1200,9 @@ export function UmaNoteApp() {
     };
   }, [supabaseConfigured]);
 
-  const loadCloudManually = useCallback(async () => {
+  const loadCloudManually = useCallback(async (
+    dataScopes?: readonly RaceDataScope[],
+  ) => {
     const userId = cloudUserIdRef.current;
     const database = localDatabaseRef.current;
     if (!userId || !database) {
@@ -1228,7 +1241,7 @@ export function UmaNoteApp() {
       string,
       { clientKey: string; version: number; value: PredictionRuleVersion }
     >();
-    await loadCloudPreview();
+    await loadCloudPreview(dataScopes);
     assertCurrentCloudOperation();
     const bootstrap = lastCloudBootstrapRef.current;
     if (!bootstrap) throw new Error("クラウド同期データを取得できませんでした。");
@@ -1626,6 +1639,7 @@ export function UmaNoteApp() {
     const fresh = await loadSyncBootstrap(
       getSupabaseClient(),
       migrationController.signal,
+      previewEntry.dataScopes,
     );
     assertCurrentMigration();
     const changedRace = selectedRaces.some((race) => {
@@ -1741,7 +1755,7 @@ export function UmaNoteApp() {
       throw new Error("移行処理が完了していません。同じ画面から再試行してください。");
     }
     migrationAttemptKeysRef.current.delete(attemptKey);
-    await loadCloudManually();
+    await loadCloudManually(previewEntry.dataScopes);
     assertCurrentMigration(ownerScope);
 
     let settingsApplied = 0;
@@ -3549,7 +3563,7 @@ function SettingsView({
   onImportRaces: (races: RaceRecord[]) => void;
   onLoadFromCloud: () => Promise<{ races: number; rules: number }>;
   onSyncToCloud: () => Promise<{ races: number; rules: number }>;
-  onLoadCloudPreview: () => Promise<{
+  onLoadCloudPreview: (dataScopes: readonly RaceDataScope[]) => Promise<{
     previewId: string;
     races: RaceRecord[];
     rules: PredictionRuleVersion[];

@@ -101,6 +101,20 @@ describe("cloud UI safety wiring", () => {
     expect(appSource).toContain("setSyncConflicts([])");
   });
 
+  it("preserves the selected race scopes through migration refreshes", () => {
+    const manualLoad = appSource.slice(
+      appSource.indexOf("const loadCloudManually"),
+      appSource.indexOf("const syncCloudManually"),
+    );
+    const migration = appSource.slice(
+      appSource.indexOf("const queueLocalMigration"),
+      appSource.indexOf("const assertConflictOwnerCurrent"),
+    );
+    expect(manualLoad).toContain("await loadCloudPreview(dataScopes)");
+    expect(migration).toContain("previewEntry.dataScopes");
+    expect(migration).toContain("await loadCloudManually(previewEntry.dataScopes)");
+  });
+
   it("refuses to resolve a conflict from a stale owner workspace", () => {
     expect(appSource).toContain("assertConflictOwnerCurrent(conflict)");
     expect(appSource).toContain("conflict.ownerScope !== ownerScopeRef.current");

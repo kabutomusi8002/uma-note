@@ -3,6 +3,7 @@ import {
   DEFAULT_USER_SETTINGS,
   RACE_DATA_SCOPES,
   type PredictionRuleVersion,
+  type RaceDataScope,
   type RaceRecord,
   type UserSettings,
 } from "@/lib/types";
@@ -66,12 +67,20 @@ export interface SyncBootstrap {
 export async function loadSyncBootstrap(
   client: SupabaseClient,
   signal?: AbortSignal,
+  dataScopes?: readonly RaceDataScope[],
 ): Promise<SyncBootstrap> {
   const request = client.rpc("get_sync_bootstrap");
   const { data, error } = await (signal ? request.abortSignal(signal) : request);
   if (error) throw repositoryError("同期初期データの取得に失敗しました", error);
   const response = object(data);
-  const races = (Array.isArray(response.races) ? response.races : []).map((item) => {
+  const selectedScopes = dataScopes ? new Set(dataScopes) : null;
+  const rawRaces = (Array.isArray(response.races) ? response.races : []).filter((item) => {
+    if (!selectedScopes) return true;
+    const row = object(item);
+    const race = object(row.race);
+    return selectedScopes.has(text(race.data_scope ?? row.data_scope) as RaceDataScope);
+  });
+  const races = rawRaces.map((item) => {
     const row = object(item);
     const value = databaseRecordToRace(row);
     return {
