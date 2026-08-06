@@ -115,6 +115,18 @@ describe("cloud UI safety wiring", () => {
     expect(migration).toContain("await loadCloudManually(previewEntry.dataScopes)");
   });
 
+  it("keeps a manual cloud read read-only and checks auth after bootstrap", () => {
+    const manualLoad = appSource.slice(
+      appSource.indexOf("const loadCloudManually"),
+      appSource.indexOf("const syncCloudManually"),
+    );
+    expect(manualLoad).not.toContain('flush("manual")');
+    expect(manualLoad).toContain("await loadCloudPreview(dataScopes)");
+    expect(manualLoad).toContain("assertCurrentCloudOperation();");
+    expect(manualLoad).toContain("authEpochRef.current !== authEpoch");
+    expect(manualLoad).toContain("cloudUserIdRef.current !== userId");
+  });
+
   it("refuses to resolve a conflict from a stale owner workspace", () => {
     expect(appSource).toContain("assertConflictOwnerCurrent(conflict)");
     expect(appSource).toContain("conflict.ownerScope !== ownerScopeRef.current");

@@ -469,6 +469,57 @@ describe("Supabase Outbox adapter", () => {
       value: { activeRuleVersionId: rule.id },
     });
     expect(bootstrap.latestChangeSequence).toBe(21);
+    expect(bootstrap.excludedInvalidRaceCount).toBe(0);
+  });
+
+  it("loads live data and reports an invalid test race during a normal pull", async () => {
+    const live = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const invalidTest = {
+      ...structuredClone(live),
+      id: "invalid-test-race",
+      clientKey: "invalid-test-race",
+      dataScope: "test" as const,
+      raceNumber: 91,
+    };
+    const { client, rpc } = clientWithResponse({
+      races: [raceToDatabasePayload(live), raceToDatabasePayload(invalidTest)],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    const bootstrap = await loadSyncBootstrap(client);
+
+    expect(bootstrap.races.map((record) => record.value.dataScope)).toEqual(["live"]);
+    expect(bootstrap.excludedInvalidRaceCount).toBe(1);
+    expect(rpc).toHaveBeenCalledOnce();
+    expect(rpc).toHaveBeenCalledWith("get_sync_bootstrap");
+    expect(rpc.mock.calls.flat().join(" ")).not.toMatch(/insert|update|delete|upsert/i);
+  });
+
+  it("fails a normal pull when live data has an invalid race number", async () => {
+    const invalidLive = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      raceNumber: 91,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const { client } = clientWithResponse({
+      races: [raceToDatabasePayload(invalidLive)],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    await expect(loadSyncBootstrap(client)).rejects.toThrow(
+      "raceNumber must be an integer from 1 to 12",
+    );
   });
 
   it("previews live races when an unselected test race has an invalid race number", async () => {
@@ -523,13 +574,8 @@ describe("Supabase Outbox adapter", () => {
       latest_change_seq: 1,
     });
 
-    const bootstrap = await loadSyncBootstrap(client, undefined, ["test"]);
-
-    await expect(buildMigrationPlan({
-      localRaces: [],
-      cloudRaces: bootstrap.races.map((record) => record.value),
-      includeScopes: { live: false, demo: false, test: true },
-    })).rejects.toThrow("raceNumber must be an integer from 1 to 12");
+    await expect(loadSyncBootstrap(client, undefined, ["test"]))
+      .rejects.toThrow("raceNumber must be an integer from 1 to 12");
   });
 
   it("ignores invalid demo and test races when neither scope is selected", async () => {

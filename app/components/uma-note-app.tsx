@@ -1508,9 +1508,11 @@ export function UmaNoteApp() {
     assertCurrentCloudOperation();
     await refreshSyncState(ownerScope);
     assertCurrentCloudOperation();
-    await syncCoordinatorRef.current?.flush("manual");
-    assertCurrentCloudOperation();
-    return { races: bootstrap.races.length, rules: bootstrap.rules.length };
+    return {
+      races: bootstrap.races.length,
+      rules: bootstrap.rules.length,
+      excludedInvalidRaces: bootstrap.excludedInvalidRaceCount,
+    };
   }, [loadCloudPreview, refreshSyncState, switchWorkspace]);
 
   useEffect(() => {
@@ -3561,7 +3563,11 @@ function SettingsView({
   syncStatus: SyncCoordinatorStatus;
   onSettingsChange: (settings: UserSettings) => void;
   onImportRaces: (races: RaceRecord[]) => void;
-  onLoadFromCloud: () => Promise<{ races: number; rules: number }>;
+  onLoadFromCloud: () => Promise<{
+    races: number;
+    rules: number;
+    excludedInvalidRaces: number;
+  }>;
   onSyncToCloud: () => Promise<{ races: number; rules: number }>;
   onLoadCloudPreview: (dataScopes: readonly RaceDataScope[]) => Promise<{
     previewId: string;
@@ -3655,12 +3661,15 @@ function SettingsView({
     setSyncState("working");
     try {
       const loaded = await onLoadFromCloud();
+      const warning = loaded.excludedInvalidRaces > 0
+        ? `不正なdemo/testレース ${loaded.excludedInvalidRaces}件を除外しました。`
+        : null;
       if (loaded.races || loaded.rules) {
         onNotify(`${loaded.races}レース・${loaded.rules}ルール版をSupabaseから読み込みました`);
       } else {
         onNotify("Supabaseに保存済みデータはありません");
       }
-      setConnectionMessage(null);
+      setConnectionMessage(warning);
       setSyncState("idle");
     } catch (cause) {
       setConnectionMessage(cause instanceof Error ? cause.message : "読み込みに失敗しました。");

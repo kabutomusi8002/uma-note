@@ -10,6 +10,7 @@ import {
 import { databaseRecordToRace } from "@/lib/supabase/race-repository";
 import { repositoryError } from "@/lib/supabase/repository-error";
 import { databaseRecordToRule } from "@/lib/supabase/rule-repository";
+import { normalizeRaceNumber } from "@/lib/race-identity";
 
 type JsonObject = Record<string, unknown>;
 
@@ -62,6 +63,7 @@ export interface SyncBootstrap {
   rules: CloudVersionedRecord<PredictionRuleVersion>[];
   settings: CloudVersionedRecord<UserSettings> | null;
   latestChangeSequence: number;
+  excludedInvalidRaceCount: number;
 }
 
 export async function loadSyncBootstrap(
@@ -74,11 +76,22 @@ export async function loadSyncBootstrap(
   if (error) throw repositoryError("同期初期データの取得に失敗しました", error);
   const response = object(data);
   const selectedScopes = dataScopes ? new Set(dataScopes) : null;
+  let excludedInvalidRaceCount = 0;
   const rawRaces = (Array.isArray(response.races) ? response.races : []).filter((item) => {
-    if (!selectedScopes) return true;
     const row = object(item);
     const race = object(row.race);
-    return selectedScopes.has(text(race.data_scope ?? row.data_scope) as RaceDataScope);
+    const dataScope = text(race.data_scope ?? row.data_scope, "live") as RaceDataScope;
+    if (selectedScopes && !selectedScopes.has(dataScope)) return false;
+    try {
+      normalizeRaceNumber(numberValue(race.race_number));
+      return true;
+    } catch (cause) {
+      if (!selectedScopes && (dataScope === "demo" || dataScope === "test")) {
+        excludedInvalidRaceCount += 1;
+        return false;
+      }
+      throw cause;
+    }
   });
   const races = rawRaces.map((item) => {
     const row = object(item);
@@ -131,6 +144,7 @@ export async function loadSyncBootstrap(
     rules,
     settings,
     latestChangeSequence: numberValue(response.latest_change_seq),
+    excludedInvalidRaceCount,
   };
 }
 
