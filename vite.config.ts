@@ -21,7 +21,7 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 export const workerDeploymentConfig = {
   main: "./worker/index.ts",
   workers_dev: false,
-  preview_urls: true,
+  preview_urls: false,
   compatibility_flags: ["nodejs_compat"],
   observability: workerObservabilityConfig,
   d1_databases: d1
