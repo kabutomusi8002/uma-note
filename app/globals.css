@@ -1807,6 +1807,58 @@ textarea:disabled {
   font-weight: 900;
 }
 
+.device-data-card {
+  border-color: rgba(174, 52, 38, 0.3);
+}
+
+.device-data-icon,
+.erase-dialog-mark {
+  background: var(--red);
+  color: #fff;
+}
+
+.device-data-list {
+  margin: 14px 0;
+}
+
+.device-data-list strong {
+  color: var(--ink);
+}
+
+.cloud-retention-note {
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: #eef6f0;
+  color: var(--green-2) !important;
+}
+
+.danger-button {
+  min-height: 42px;
+  border: 1px solid var(--red);
+  border-radius: 10px;
+  background: var(--red);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.danger-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.erase-dialog-description {
+  margin-top: 12px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.75;
+}
+
+.erase-dialog-description p {
+  margin: 8px 0 0;
+}
+
 .connection-state {
   display: inline-flex;
   margin: 12px 0;
