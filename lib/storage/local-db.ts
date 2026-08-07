@@ -15,6 +15,12 @@ import {
   coalesceOutboxMutation,
   createOutboxMutation,
 } from "../sync/outbox";
+import {
+  validateOutboxMutation,
+  validateRaceRecords,
+  validateRuleVersions,
+  validateWorkspaceSnapshot,
+} from "../runtime-validation";
 
 const DATABASE_NAME = "uma-note-local";
 const DATABASE_VERSION = 1;
@@ -896,7 +902,11 @@ class StateDatabaseAdapter implements LocalDatabaseAdapter {
       const parsed = JSON.parse(this.storage.getItem(FALLBACK_STATE_KEY) ?? "null") as
         | Partial<LocalStorageState>
         | null;
-      if (parsed?.version !== 2) return emptyState();
+      if (parsed === null) return emptyState();
+      if (parsed.version !== 2) throw new Error("Unsupported local database format");
+      if (!parsed.workspaces || !parsed.outbox || !parsed.conflicts || !parsed.metadata) {
+        throw new Error("Invalid local database document");
+      }
       return {
         version: 2,
         workspaces: parsed.workspaces ?? {},
@@ -904,8 +914,8 @@ class StateDatabaseAdapter implements LocalDatabaseAdapter {
         conflicts: parsed.conflicts ?? {},
         metadata: parsed.metadata ?? {},
       };
-    } catch {
-      return emptyState();
+    } catch (error) {
+      throw new Error("Local database data is invalid; the stored copy was retained", { cause: error });
     }
   }
 
@@ -1451,13 +1461,16 @@ async function migrateLegacyV1(
   const existing = await adapter.getWorkspace(ownerScope);
   if (!existing && (races || rules || activeRaceId)) {
     const timestamp = now().toISOString();
-    const normalizedRaces = ((races ?? []) as LegacyRaceRecord[]).map((race) =>
-      backfillRaceClientKey(race) as RaceRecord
+    const normalizedRaces = validateRaceRecords(
+      ((races ?? []) as LegacyRaceRecord[]).map((race) =>
+        backfillRaceClientKey(race) as RaceRecord
+      ),
+      "legacy.races",
     );
     const workspace: WorkspaceSnapshot = {
       ownerScope,
       races: normalizedRaces,
-      rules: (rules ?? []) as WorkspaceSnapshot["rules"],
+      rules: validateRuleVersions(rules ?? [], "legacy.rules"),
       settings: activeRaceId ? { activeRaceId } : {},
       updatedAt: timestamp,
     };
@@ -1571,7 +1584,8 @@ export function getWorkspace(
     if (!workspace) return null;
     const storedMutations = await adapter.listOutbox(ownerScope);
     const normalizedMutations: OutboxMutation[] = [];
-    for (const stored of storedMutations) {
+    for (const rawStored of storedMutations) {
+      const stored = validateOutboxMutation(rawStored, ownerScope, false);
       const normalized = normalizeRaceOutboxMutation(stored);
       normalizedMutations.push(normalized.mutation);
       if (normalized.changed) {
@@ -1584,10 +1598,14 @@ export function getWorkspace(
       workspace,
       normalizedMutations,
     );
+    const validatedWorkspace = validateWorkspaceSnapshot(
+      normalizedWorkspace.workspace,
+      ownerScope,
+    );
     if (normalizedWorkspace.changed) {
       await adapter.replaceWorkspace(normalizedWorkspace.workspace, []);
     }
-    return normalizedWorkspace.workspace;
+    return validatedWorkspace;
   })();
 }
 
@@ -1603,11 +1621,20 @@ export function replaceWorkspace(
   if (mutations.some((mutation) => mutation.ownerScope !== workspace.ownerScope)) {
     return Promise.reject(new Error("Workspace and outbox owner scopes must match"));
   }
-  const normalizedMutations = mutations.map(
+  let validatedWorkspace: WorkspaceSnapshot;
+  let validatedMutations: OutboxMutation[];
+  try {
+    validatedWorkspace = validateWorkspaceSnapshot(workspace, workspace.ownerScope);
+    validatedMutations = mutations.map((mutation) =>
+      validateOutboxMutation(mutation, workspace.ownerScope, false));
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  const normalizedMutations = validatedMutations.map(
     (mutation) => normalizeRaceOutboxMutation(mutation).mutation,
   );
   const normalizedWorkspace = normalizeWorkspaceRaceClientKeys(
-    workspace,
+    validatedWorkspace,
     normalizedMutations,
   ).workspace;
   return database[INTERNAL].replaceWorkspace(
@@ -1620,9 +1647,14 @@ export function enqueueMutation(
   database: LocalDatabase,
   mutation: OutboxMutation,
 ): Promise<OutboxMutation> {
-  return database[INTERNAL].enqueueMutation(
-    clone(normalizeRaceOutboxMutation(mutation).mutation),
-  );
+  try {
+    const validated = validateOutboxMutation(mutation, mutation.ownerScope, false);
+    return database[INTERNAL].enqueueMutation(
+      clone(normalizeRaceOutboxMutation(validated).mutation),
+    );
+  } catch (error) {
+    return Promise.reject(error);
+  }
 }
 
 export function listOutbox(
@@ -1633,7 +1665,8 @@ export function listOutbox(
     const adapter = database[INTERNAL];
     const stored = await adapter.listOutbox(ownerScope);
     const normalized: OutboxMutation[] = [];
-    for (const mutation of stored) {
+    for (const rawMutation of stored) {
+      const mutation = validateOutboxMutation(rawMutation, rawMutation.ownerScope, false);
       const result = normalizeRaceOutboxMutation(mutation);
       normalized.push(result.mutation);
       if (result.changed) {

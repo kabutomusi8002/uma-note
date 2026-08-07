@@ -118,6 +118,12 @@ import {
 } from "@/lib/sync/connection-presentation";
 import { SyncConflictDialog } from "./sync-conflict-dialog";
 import { CloudMigrationPanel } from "./cloud-migration-panel";
+import {
+  validateOutboxMutation,
+  validateRaceRecords,
+  validateRuleVersions,
+  validateUserSettings,
+} from "@/lib/runtime-validation";
 
 type AppView = "home" | "race" | "analysis" | "rules" | "settings";
 type RaceStage = "prediction" | "bets" | "result" | "review";
@@ -485,6 +491,7 @@ export function UmaNoteApp() {
   const rulesRef = useRef(rules);
   const settingsRef = useRef(settings);
   const activeRaceIdRef = useRef(activeRaceId);
+  const storageValidationFailedRef = useRef(false);
   const syncTimerRef = useRef<number | null>(null);
   const online = useSyncExternalStore(
     subscribeToConnection,
@@ -523,19 +530,22 @@ export function UmaNoteApp() {
           localStorage.getItem(LOCAL_DIRTY_RACES_KEY) ?? "[]",
         ) as unknown;
 
-        if (Array.isArray(storedDirtyRaceIds)) {
+        if (Array.isArray(storedDirtyRaceIds) && storedDirtyRaceIds.every((id) => typeof id === "string")) {
           dirtyRaceIdsRef.current = new Set(
-            storedDirtyRaceIds.filter((id): id is string => typeof id === "string"),
+            storedDirtyRaceIds,
           );
+        } else {
+          throw new Error("Invalid dirty race ID list");
         }
 
-        if (!cancelled && isRaceRecordArray(storedRaces)) {
-          const hydratedRaces = upgradeLegacyPredictionLocks(
+        if (!cancelled && storedRaces !== null) {
+          if (!Array.isArray(storedRaces)) throw new Error("Invalid stored races");
+          const hydratedRaces = validateRaceRecords(upgradeLegacyPredictionLocks(
             normalizeKnownDemoRaceScopes(
-              storedRaces.map((race) => backfillRaceClientKey(race)),
+              storedRaces.map((race) => backfillRaceClientKey(race as RaceRecord)),
               DEMO_RACE_IDS,
             ),
-          );
+          ), "localStorage.races");
           setRaces(hydratedRaces);
           setActiveRaceId(
             storedActiveRaceId && hydratedRaces.some((race) => race.id === storedActiveRaceId)
@@ -543,13 +553,15 @@ export function UmaNoteApp() {
               : (hydratedRaces[0]?.id ?? ""),
           );
         }
-        if (!cancelled && isRuleVersionArray(storedRules) && storedRules.length) {
-          setRules(storedRules);
+        if (!cancelled && storedRules !== null) {
+          const validatedRules = validateRuleVersions(storedRules, "localStorage.rules");
+          if (validatedRules.length) setRules(validatedRules);
         }
-        if (!cancelled && isUserSettings(storedSettings)) {
-          setSettings(storedSettings);
+        if (!cancelled && storedSettings !== null) {
+          setSettings(validateUserSettings(storedSettings, "localStorage.settings"));
         }
       } catch {
+        storageValidationFailedRef.current = true;
         if (!cancelled) setToast("端末内データを読み込めなかったため、デモデータで開始しました");
       } finally {
         if (!cancelled) setStorageReady(true);
@@ -563,6 +575,7 @@ export function UmaNoteApp() {
 
   useEffect(() => {
     if (!storageReady) return;
+    if (storageValidationFailedRef.current) return;
     try {
       if (ownerScopeRef.current === LEGACY_OWNER_SCOPE) {
         localStorage.setItem(LOCAL_RACES_KEY, JSON.stringify(races));
@@ -1045,6 +1058,12 @@ export function UmaNoteApp() {
   }
 
   const enqueueDurableMutation = useCallback((mutation: OutboxMutation) => {
+    try {
+      mutation = validateOutboxMutation(mutation, mutation.ownerScope);
+    } catch {
+      setToast("変更データが不正なため、Outboxへの投入を停止しました");
+      return;
+    }
     const database = localDatabaseRef.current;
     const enqueue = database
       ? replaceWorkspace(database, {
