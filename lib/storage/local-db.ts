@@ -22,7 +22,7 @@ import {
   validateWorkspaceSnapshot,
 } from "../runtime-validation";
 
-const DATABASE_NAME = "uma-note-local";
+export const LOCAL_DATABASE_NAME = "uma-note-local";
 const DATABASE_VERSION = 1;
 const FALLBACK_STATE_KEY = "uma-note:local-db:v2";
 const LEGACY_RACES_KEY = "uma-note:races:v1";
@@ -182,6 +182,11 @@ export interface OpenLocalDatabaseOptions {
   legacyOwnerScope?: OwnerScope;
   now?: () => Date;
   randomUUID?: () => string;
+}
+
+export interface DeleteLocalDatabaseOptions {
+  name?: string;
+  indexedDB?: IDBFactory | null;
 }
 
 function clone<T>(value: T): T {
@@ -1507,7 +1512,7 @@ async function migrateLegacyV1(
 export async function openLocalDatabase(
   options: OpenLocalDatabaseOptions = {},
 ): Promise<LocalDatabase> {
-  const name = options.name ?? DATABASE_NAME;
+  const name = options.name ?? LOCAL_DATABASE_NAME;
   const storage =
     options.localStorage === undefined
       ? safelyGetBrowserStorage()
@@ -1572,6 +1577,37 @@ export async function openLocalDatabase(
     close: () => adapter.close(),
     [INTERNAL]: adapter,
   };
+}
+
+/** Deletes only UMA NOTE's named IndexedDB database. */
+export async function deleteLocalDatabase(
+  options: DeleteLocalDatabaseOptions = {},
+): Promise<void> {
+  const factory = options.indexedDB === undefined
+    ? safelyGetBrowserIndexedDB()
+    : options.indexedDB;
+  if (!factory) return;
+  const name = options.name ?? LOCAL_DATABASE_NAME;
+  await new Promise<void>((resolve, reject) => {
+    let request: IDBOpenDBRequest;
+    try {
+      request = factory.deleteDatabase(name);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    request.addEventListener("success", () => resolve(), { once: true });
+    request.addEventListener(
+      "error",
+      () => reject(request.error ?? new Error("Unable to delete UMA NOTE IndexedDB")),
+      { once: true },
+    );
+    request.addEventListener(
+      "blocked",
+      () => reject(new Error("UMA NOTE IndexedDB deletion is blocked by another tab")),
+      { once: true },
+    );
+  });
 }
 
 export function getWorkspace(

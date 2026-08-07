@@ -1,6 +1,10 @@
 "use client";
 
 import {
+  eraseUmaNoteDeviceData,
+  UMA_NOTE_LOCAL_STORAGE_KEYS,
+} from "@/lib/storage/device-data";
+import {
   useCallback,
   useEffect,
   useMemo,
@@ -128,13 +132,15 @@ import {
 type AppView = "home" | "race" | "analysis" | "rules" | "settings";
 type RaceStage = "prediction" | "bets" | "result" | "review";
 
-const LOCAL_RACES_KEY = "uma-note:races:v1";
-const LOCAL_RULES_KEY = "uma-note:rules:v1";
-const LOCAL_ACTIVE_RACE_KEY = "uma-note:active-race:v1";
-const LOCAL_DIRTY_RACES_KEY = "uma-note:dirty-races:v1";
-const LOCAL_SETTINGS_KEY = "uma-note:settings:v1";
-const INSTALLATION_ID_KEY = "uma-note:installation-id:v1";
-const ACTIVE_OWNER_SCOPE_KEY = "uma-note:active-owner-scope:v1";
+const [
+  LOCAL_RACES_KEY,
+  LOCAL_RULES_KEY,
+  LOCAL_ACTIVE_RACE_KEY,
+  LOCAL_DIRTY_RACES_KEY,
+  LOCAL_SETTINGS_KEY,
+  INSTALLATION_ID_KEY,
+  ACTIVE_OWNER_SCOPE_KEY,
+] = UMA_NOTE_LOCAL_STORAGE_KEYS;
 const CLOUD_SAVE_DELAY_MS = 700;
 
 const NAV_ITEMS: readonly {
@@ -2308,6 +2314,86 @@ export function UmaNoteApp() {
     queueSettingsCloudSave(nextSettings);
   }
 
+  async function eraseDeviceData(): Promise<void> {
+    // Reuse the normal logout path so the SDK, rather than this UI, owns Auth storage.
+    if (
+      supabaseConfigured &&
+      (cloudAuthStatus === "authenticated" || cloudAuthStatus === "expired")
+    ) {
+      await signOutFromCloud();
+    }
+
+    syncCoordinatorRef.current?.stop();
+    syncCoordinatorRef.current = null;
+    if (syncTimerRef.current !== null) {
+      window.clearTimeout(syncTimerRef.current);
+      syncTimerRef.current = null;
+    }
+    localMigrationAbortRef.current?.abort();
+    localMigrationAbortRef.current = null;
+    authEpochRef.current += 1;
+    workspaceSwitchRequestRef.current += 1;
+    syncStateRequestRef.current += 1;
+    cloudProbeRequestRef.current += 1;
+    setStorageReady(false);
+
+    const database = localDatabaseRef.current;
+    try {
+      await eraseUmaNoteDeviceData({ database });
+    } catch (error) {
+      localDatabaseRef.current = null;
+      setLocalDatabase(null);
+      try {
+        const recoveredDatabase = await openLocalDatabase({
+          legacyOwnerScope: LEGACY_OWNER_SCOPE,
+        });
+        localDatabaseRef.current = recoveredDatabase;
+        setLocalDatabase(recoveredDatabase);
+      } finally {
+        setStorageReady(true);
+      }
+      throw error;
+    }
+    localDatabaseRef.current = null;
+    setLocalDatabase(null);
+
+    const emptyRaces: RaceRecord[] = [];
+    const emptyRules: PredictionRuleVersion[] = [];
+    const resetSettings = { ...DEFAULT_USER_SETTINGS };
+    racesRef.current = emptyRaces;
+    rulesRef.current = emptyRules;
+    settingsRef.current = resetSettings;
+    activeRaceIdRef.current = "";
+    ownerScopeRef.current = LEGACY_OWNER_SCOPE;
+    cloudUserIdRef.current = null;
+    syncAuthRef.current = { status: "anonymous" };
+    authIdentityRef.current = supabaseConfigured ? "anonymous" : "local";
+    installationIdRef.current = "";
+    dirtyRaceIdsRef.current.clear();
+    pendingMutationsRef.current = [];
+    migrationAttemptKeysRef.current.clear();
+    lastCloudBootstrapRef.current = null;
+    cloudPreviewSnapshotsRef.current.clear();
+    cloudVersionsRef.current.clear();
+    cloudRuleSetVersionsRef.current.clear();
+    cloudBaseSnapshotsRef.current.clear();
+    cloudRaceByNaturalKeyRef.current.clear();
+    cloudRaceAliasesRef.current.clear();
+    cloudRuleByIdentityRef.current.clear();
+    cloudRuleAliasesRef.current.clear();
+    setRaces(emptyRaces);
+    setRules(emptyRules);
+    setSettings(resetSettings);
+    setActiveRaceId("");
+    setActiveOwnerScope(LEGACY_OWNER_SCOPE);
+    setCloudAuthStatus(supabaseConfigured ? "anonymous" : "local");
+    setCloudConnectionProbe(supabaseConfigured ? "checking" : "local");
+    setPendingSyncCount(0);
+    setSyncConflicts([]);
+    setSyncStatus({ phase: "stopped", pendingCount: 0 });
+    setView("settings");
+  }
+
   const allSettlement = useMemo(
     () => races
       .filter(isRaceIncludedInPerformance)
@@ -2428,6 +2514,7 @@ export function UmaNoteApp() {
             onSyncToCloud={syncCloudManually}
             onLoadCloudPreview={loadCloudPreview}
             onQueueMigration={queueLocalMigration}
+            onEraseDeviceData={eraseDeviceData}
             onNotify={setToast}
           />
         )}
@@ -3572,6 +3659,7 @@ function SettingsView({
   onSyncToCloud,
   onLoadCloudPreview,
   onQueueMigration,
+  onEraseDeviceData,
   onNotify,
 }: {
   races: RaceRecord[];
@@ -3602,6 +3690,7 @@ function SettingsView({
     planHash: string;
     previewId: string;
   }) => Promise<number>;
+  onEraseDeviceData: () => Promise<void>;
   onNotify: (message: string) => void;
 }) {
   const [importText, setImportText] = useState("");
@@ -3614,6 +3703,9 @@ function SettingsView({
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<"idle" | "working" | "error">("idle");
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
+  const [eraseDialogOpen, setEraseDialogOpen] = useState(false);
+  const [eraseState, setEraseState] = useState<"idle" | "working" | "error">("idle");
+  const [eraseError, setEraseError] = useState<string | null>(null);
   const supabaseConfigured = isSupabaseConfigured();
 
   useEffect(() => {
@@ -3673,6 +3765,23 @@ function SettingsView({
     } catch {
       setConnectionMessage("ログアウトできませんでした。通信状態を確認してください。");
       setSyncState("error");
+    }
+  }
+
+  async function confirmDeviceDataErase() {
+    setEraseState("working");
+    setEraseError(null);
+    try {
+      await onEraseDeviceData();
+      setUserEmail(null);
+      setOtpToken("");
+      setOtpRequested(false);
+      setEraseDialogOpen(false);
+      setEraseState("idle");
+      onNotify("この端末のUMA NOTEデータを消去しました。クラウドデータは削除されていません。");
+    } catch {
+      setEraseError("端末内データを完全に消去できませんでした。別のUMA NOTEタブを閉じて、もう一度お試しください。");
+      setEraseState("error");
     }
   }
 
@@ -3863,6 +3972,34 @@ function SettingsView({
           onNotify={onNotify}
         />
 
+        <section className="settings-card device-data-card">
+          <div className="settings-icon device-data-icon" aria-hidden="true">端末</div>
+          <div>
+            <p className="eyebrow dark">BROWSER STORAGE</p>
+            <h2>この端末のデータ</h2>
+            <p>レース予想・購入・結果・設定などは、このブラウザの端末内ストレージにも保存されます。クラウド同期とは別管理です。</p>
+          </div>
+          <ul className="check-list device-data-list">
+            <li><strong>消えるもの:</strong> UMA NOTEのレース、ルール、設定、Workspace、Outbox、競合情報、ログイン状態</li>
+            <li><strong>消えないもの:</strong> Supabase上のクラウドデータ、他サイト・他アプリのブラウザデータ</li>
+          </ul>
+          <p className="security-note">共有端末では、利用後にこの端末のデータ消去を推奨します。通常の「ログアウト」だけでは端末データは消えません。</p>
+          <p className="cloud-retention-note"><strong>Supabase上のクラウドデータは削除されません。</strong></p>
+          <button
+            className="danger-button full"
+            type="button"
+            disabled={eraseState === "working"}
+            onClick={() => {
+              setEraseError(null);
+              setEraseState("idle");
+              setEraseDialogOpen(true);
+            }}
+          >
+            この端末のUMA NOTEデータを消去
+          </button>
+          {eraseError && <p className="form-error" role="alert">{eraseError}</p>}
+        </section>
+
         <section className="settings-card preferences-card">
           <div className="settings-icon" aria-hidden="true">⚙</div>
           <div>
@@ -3931,6 +4068,44 @@ function SettingsView({
           <div><p className="eyebrow dark">SCOPE</p><h2>自動投票は行いません</h2><p>このアプリは予想・購入記録・収支分析専用です。JRA等へのログイン、投票送信、決済処理は実装していません。</p></div>
         </section>
       </div>
+      {eraseDialogOpen && (
+        <div className="lock-dialog-backdrop">
+          <div
+            className="lock-dialog erase-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="erase-dialog-title"
+            aria-describedby="erase-dialog-description"
+          >
+            <span className="lock-dialog-mark erase-dialog-mark" aria-hidden="true">!</span>
+            <p className="eyebrow dark">IRREVERSIBLE ON THIS DEVICE</p>
+            <h2 id="erase-dialog-title">この端末のデータを消去しますか？</h2>
+            <div id="erase-dialog-description" className="erase-dialog-description">
+              <p>レース・ルール・設定、Workspace、未同期のOutbox、競合情報、ログイン状態をこのブラウザから消去します。</p>
+              <p><strong>未同期の変更は復元できません。Supabase上のクラウドデータは削除されません。</strong></p>
+            </div>
+            {eraseError && <p className="form-error" role="alert">{eraseError}</p>}
+            <div className="lock-dialog-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={eraseState === "working"}
+                onClick={() => setEraseDialogOpen(false)}
+              >
+                キャンセル
+              </button>
+              <button
+                className="danger-button"
+                type="button"
+                disabled={eraseState === "working"}
+                onClick={confirmDeviceDataErase}
+              >
+                {eraseState === "working" ? "消去中…" : "消去を実行"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
