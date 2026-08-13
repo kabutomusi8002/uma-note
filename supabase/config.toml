@@ -154,6 +154,9 @@ max_indexes = 5
 
 [auth]
 enabled = true
+# LOCAL DEVELOPMENT ONLY. This file configures `supabase start`; it does not
+# configure or prove the security of any hosted Supabase project. Production
+# Auth settings must be checked manually against docs/production-auth.md.
 # The base URL of your website. Used as an allow-list for redirects and for constructing URLs used
 # in emails.
 site_url = "http://127.0.0.1:4173"
@@ -178,15 +181,18 @@ enable_signup = true
 enable_anonymous_sign_ins = false
 # Allow/disallow testing manual linking of accounts
 enable_manual_linking = false
+# The app does not implement password authentication. Supabase groups password
+# and email OTP under the email provider, so keep these local defaults only as
+# defense in depth; production password settings are conditional checklist items.
 # Passwords shorter than this value will be rejected as weak. Minimum 6, recommended 8 or more.
 minimum_password_length = 6
 # Passwords that do not meet the following requirements will be rejected as weak. Supported values
 # are: `letters_digits`, `lower_upper_letters_digits`, `lower_upper_letters_digits_symbols`
 password_requirements = ""
 
-# Configure passkey sign-ins.
-# [auth.passkey]
-# enabled = false
+# Configure passkey sign-ins. UMA NOTE does not use passkeys.
+[auth.passkey]
+enabled = false
 
 # Configure WebAuthn relying party settings (required when passkey is enabled).
 # [auth.webauthn]
@@ -210,6 +216,9 @@ token_verifications = 30
 # Number of Web3 logins that can be made in a 5 minute interval per IP address.
 web3 = 30
 
+# CAPTCHA needs a provider secret and is intentionally not represented as
+# enabled here. It is a mandatory manual production check; do not copy a secret
+# into this tracked file.
 # Configure one of the supported captcha providers: `hcaptcha`, `turnstile`.
 # [auth.captcha]
 # enabled = true
@@ -217,21 +226,27 @@ web3 = 30
 # secret = ""
 
 [auth.email]
+# Email OTP (and the existing magic-link fallback) is the only enabled sign-in
+# provider used by the app. New-user creation is intentional for the current
+# public-signup policy (`shouldCreateUser: true` in lib/supabase/auth.ts).
 # Allow/disallow new user signups via email to your project.
 enable_signup = true
 # If enabled, a user will be required to confirm any email change on both the old, and new email
 # addresses. If disabled, only the new email is required to confirm.
 double_confirm_changes = true
-# If enabled, users need to confirm their email address before signing in.
+# OTP verification itself proves access to the mailbox. Keep the separate
+# signup confirmation disabled locally so the six-digit OTP flow still works.
+# Hosted production behavior must be checked manually.
 enable_confirmations = false
 # If enabled, users will need to reauthenticate or have logged in recently to change their password.
 secure_password_change = false
 # Controls the minimum amount of time that must pass before sending another signup confirmation or password reset email.
-max_frequency = "1s"
+max_frequency = "60s"
 # Number of characters used in the email OTP.
 otp_length = 6
-# Number of seconds before the email OTP expires (defaults to 1 hour).
-otp_expiry = 3600
+# Keep the local OTP lifetime short enough to limit guessing while remaining
+# usable during development. Production must be reviewed independently.
+otp_expiry = 600
 
 # Use a production-ready SMTP server
 # [auth.email.smtp]
