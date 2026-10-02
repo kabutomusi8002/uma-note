@@ -189,6 +189,7 @@ describe("migration preview", () => {
       backupHash: "backup-123",
       previewReviewed: true,
       selectedSourceIds: ["local-upcoming"],
+      scopeSelection: plan.scopeSelection,
       confirmationText: migrationConfirmationText(1),
     } as const;
 
@@ -200,6 +201,42 @@ describe("migration preview", () => {
       }),
     ).toContain("confirmation text does not match the selected count");
     expect(canConfirmMigration(plan, { ...confirmation, backupSaved: false })).toBe(false);
+  });
+
+  it("プレビュー後にscopeを外した確認は、プランが更新されるまでconfirmできない", async () => {
+    const live = liveUpcoming();
+    const test = {
+      ...liveUpcoming(),
+      id: "local-test",
+      clientKey: "local-test",
+      raceNumber: 9,
+      dataScope: "test" as const,
+    };
+    const plan = await buildMigrationPlan({
+      localRaces: [live, test],
+      cloudRaces: [],
+      includeScopes: { live: true, demo: false, test: true },
+      backupHash: "backup-scopes",
+    });
+    const confirmation = {
+      planHash: plan.hash,
+      backupSaved: true,
+      backupHash: "backup-scopes",
+      previewReviewed: true,
+      selectedSourceIds: ["local-test", "local-upcoming"],
+      scopeSelection: { live: true, demo: false, test: true },
+      confirmationText: migrationConfirmationText(2),
+    } as const;
+
+    expect(canConfirmMigration(plan, confirmation)).toBe(true);
+    expect(migrationConfirmationIssues(plan, {
+      ...confirmation,
+      scopeSelection: { live: true, demo: false, test: false },
+    })).toContain("scope selection does not match the plan");
+    expect(canConfirmMigration(plan, {
+      ...confirmation,
+      scopeSelection: { live: false, demo: false, test: false },
+    })).toBe(false);
   });
 
   it("ルールまたは設定だけを選んだ移行も明示確認できる", async () => {
@@ -215,6 +252,7 @@ describe("migration preview", () => {
       backupHash: "backup-extra-only",
       previewReviewed: true,
       selectedSourceIds: [],
+      scopeSelection: plan.scopeSelection,
       selectedAdditionalCount: 1,
       confirmationText: migrationConfirmationText(1),
     })).toBe(true);
@@ -224,6 +262,7 @@ describe("migration preview", () => {
       backupHash: "backup-extra-only",
       previewReviewed: true,
       selectedSourceIds: [],
+      scopeSelection: plan.scopeSelection,
       selectedAdditionalCount: 0,
       confirmationText: migrationConfirmationText(0),
     })).toBe(false);

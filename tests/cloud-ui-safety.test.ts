@@ -101,6 +101,53 @@ describe("cloud UI safety wiring", () => {
     expect(appSource).toContain("setSyncConflicts([])");
   });
 
+  it("preserves the selected race scopes through migration refreshes", () => {
+    const manualLoad = appSource.slice(
+      appSource.indexOf("const loadCloudManually"),
+      appSource.indexOf("const syncCloudManually"),
+    );
+    const migration = appSource.slice(
+      appSource.indexOf("const queueLocalMigration"),
+      appSource.indexOf("const assertConflictOwnerCurrent"),
+    );
+    expect(manualLoad).toContain("await loadCloudPreview(dataScopes)");
+    expect(migration).toContain("previewEntry.dataScopes");
+    expect(migration).toContain("await loadCloudManually(previewEntry.dataScopes)");
+  });
+
+  it("keeps a manual cloud read read-only and checks auth after bootstrap", () => {
+    const manualLoad = appSource.slice(
+      appSource.indexOf("const loadCloudManually"),
+      appSource.indexOf("const syncCloudManually"),
+    );
+    expect(manualLoad).not.toContain('flush("manual")');
+    expect(manualLoad).toContain("await loadCloudPreview(dataScopes)");
+    expect(manualLoad).toContain("assertCurrentCloudOperation();");
+    expect(manualLoad).toContain("authEpochRef.current !== authEpoch");
+    expect(manualLoad).toContain("cloudUserIdRef.current !== userId");
+  });
+
+  it("invalidates the previous plan and approval before refreshing the preview", () => {
+    const loadPreview = migrationSource.slice(
+      migrationSource.indexOf("const loadPreview"),
+      migrationSource.indexOf("const changeScope"),
+    );
+    const refresh = loadPreview.indexOf("await onLoadCloudPreview(");
+    expect(refresh).toBeGreaterThan(0);
+    for (const reset of [
+      "setCloudPreviewId(null)",
+      "setPlan(null)",
+      "setSelectedIds(new Set())",
+      "setPreviewReviewed(false)",
+      'setConfirmationText("")',
+    ]) {
+      const index = loadPreview.indexOf(reset);
+      expect(index, reset).toBeGreaterThan(0);
+      expect(index, reset).toBeLessThan(refresh);
+    }
+    expect(migrationSource).toContain("scopeSelection: scopes");
+  });
+
   it("refuses to resolve a conflict from a stale owner workspace", () => {
     expect(appSource).toContain("assertConflictOwnerCurrent(conflict)");
     expect(appSource).toContain("conflict.ownerScope !== ownerScopeRef.current");

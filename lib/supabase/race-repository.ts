@@ -147,6 +147,9 @@ function predictionSnapshot(
 }
 
 function ticketNumbers(ticket: JsonObject): number[] {
+  if (Array.isArray(ticket.selections)) {
+    return ticket.selections.filter((value): value is number => typeof value === "number");
+  }
   return [
     ticket.first_horse_number,
     ticket.second_horse_number,
@@ -510,12 +513,13 @@ export function databaseRecordToRace(raw: unknown): RaceRecord {
       horseName: text(entry.horse_name),
     }))
     .filter((entry) => entry.horseNumber > 0 && entry.horseName.trim().length > 0);
+  const entryNameByNumber = new Map(entries.map((entry) => [entry.horseNumber, entry.horseName]));
 
   const selectedHorses = selections
     .filter((selection) => MARK_FROM_DATABASE[text(selection.mark)])
     .map((selection) => ({
       horseNumber: numberValue(selection.horse_number),
-      horseName: text(selection.horse_name),
+      horseName: text(selection.horse_name, entryNameByNumber.get(numberValue(selection.horse_number)) ?? ""),
       mark: MARK_FROM_DATABASE[text(selection.mark)],
       comment: text(selection.evaluation) || undefined,
     }));

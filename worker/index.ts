@@ -13,6 +13,20 @@ const DISABLED_IMAGE_PATHS = new Set([
   "/_vinext/image/",
 ]);
 const NOT_FOUND_BODY = "Not Found\n";
+const SECURITY_HEADERS = {
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+} as const;
+
+function withSecurityHeaders(response: Response): Response {
+  const secured = new Response(response.body, response);
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+    secured.headers.set(name, value);
+  }
+  return secured;
+}
 
 function disabledImageResponse(method: string): Response {
   return new Response(method.toUpperCase() === "HEAD" ? null : NOT_FOUND_BODY, {
@@ -30,10 +44,10 @@ const worker = {
     const url = new URL(request.url);
 
     if (DISABLED_IMAGE_PATHS.has(url.pathname)) {
-      return disabledImageResponse(request.method);
+      return withSecurityHeaders(disabledImageResponse(request.method));
     }
 
-    return handler.fetch(request, env, ctx);
+    return withSecurityHeaders(await handler.fetch(request, env, ctx));
   },
 };
 

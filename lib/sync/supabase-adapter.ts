@@ -5,6 +5,11 @@ import { syncRaceRecord } from "../supabase/race-repository";
 import { syncRuleVersion } from "../supabase/rule-repository";
 import { syncUserSettings } from "../supabase/sync-repository";
 import type { OutboxMutation, PushResult } from "./types";
+import {
+  validateOutboxMutation,
+  validateUserSettings,
+} from "../runtime-validation";
+import { validatePredictionRuleVersion, validateRaceRecord } from "../race-format";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -52,6 +57,14 @@ export async function pushOutboxMutation(
   installationId: string,
   signal?: AbortSignal,
 ): Promise<PushResult> {
+  try {
+    mutation = validateOutboxMutation(mutation, mutation.ownerScope);
+  } catch (error) {
+    return {
+      status: "rejected",
+      message: error instanceof Error ? error.message : "Invalid Outbox mutation",
+    };
+  }
   if (mutation.operation === "delete") {
     return {
       status: "rejected",
@@ -64,13 +77,16 @@ export async function pushOutboxMutation(
     if (!isRaceRecord(mutation.payload)) {
       return { status: "rejected", message: "レース同期データが不正です。" };
     }
-    if (raceClientKey(mutation.payload) !== mutation.entityKey) {
+    let payload: RaceRecord;
+    try { payload = validateRaceRecord(mutation.payload); }
+    catch (error) { return { status: "rejected", message: error instanceof Error ? error.message : "Invalid race" }; }
+    if (raceClientKey(payload) !== mutation.entityKey) {
       return {
         status: "rejected",
         message: "Race Outbox entityKey does not match the persisted clientKey.",
       };
     }
-    const result = await syncRaceRecord(client, mutation.payload, {
+    const result = await syncRaceRecord(client, payload, {
       expectedVersion,
       mutationId: mutation.mutationId,
       installationId,
@@ -94,12 +110,15 @@ export async function pushOutboxMutation(
     if (!isRuleVersion(mutation.payload)) {
       return { status: "rejected", message: "ルール同期データが不正です。" };
     }
-    const result = await syncRuleVersion(client, mutation.payload, {
+    let payload: PredictionRuleVersion;
+    try { payload = validatePredictionRuleVersion(mutation.payload); }
+    catch (error) { return { status: "rejected", message: error instanceof Error ? error.message : "Invalid rule" }; }
+    const result = await syncRuleVersion(client, payload, {
       expectedVersion,
       expectedParentVersion: mutation.expectedParentVersion,
       mutationId: mutation.mutationId,
       installationId,
-      activate: mutation.payload.isActive,
+      activate: payload.isActive,
       signal,
     });
     if (result.status === "conflict") {
@@ -125,7 +144,10 @@ export async function pushOutboxMutation(
   if (!isUserSettings(mutation.payload)) {
     return { status: "rejected", message: "設定同期データが不正です。" };
   }
-  const result = await syncUserSettings(client, mutation.payload, {
+  let payload: UserSettings;
+  try { payload = validateUserSettings(mutation.payload, "outbox.payload"); }
+  catch (error) { return { status: "rejected", message: error instanceof Error ? error.message : "Invalid settings" }; }
+  const result = await syncUserSettings(client, payload, {
     expectedVersion,
     mutationId: mutation.mutationId,
     installationId,

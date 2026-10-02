@@ -341,6 +341,13 @@ function validateRuleVersion(
   };
 }
 
+/** Validate a rule version at browser/database/RPC trust boundaries. */
+export function validatePredictionRuleVersion(
+  value: unknown,
+): PredictionRuleVersion {
+  return validateRuleVersion(value, "rule");
+}
+
 /** Validate and normalize data at a trust boundary such as import or API input. */
 export function validateRaceRecord(value: unknown): RaceRecord {
   const race = objectAt(value, "race");
@@ -669,6 +676,19 @@ export function validateRaceRecord(value: unknown): RaceRecord {
 
   return {
     id,
+    ...(race.cloudId === undefined
+      ? {}
+      : { cloudId: stringAt(race.cloudId, "race.cloudId") }),
+    ...(race.syncVersion === undefined
+      ? {}
+      : {
+          syncVersion: integerAt(
+            race.syncVersion,
+            "race.syncVersion",
+            1,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        }),
     clientKey,
     ...(dataScope === undefined ? {} : { dataScope }),
     ...(status === undefined ? {} : { status }),

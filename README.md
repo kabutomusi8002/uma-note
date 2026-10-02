@@ -85,6 +85,8 @@ npm run dev
 
 ## Supabase接続
 
+本番公開前のAuth設定は [Supabase Auth production checklist](docs/production-auth.md) を参照してください。`supabase/config.toml` はローカル開発専用であり、本番Dashboardへ反映されず、本番設定が強化済みであることも保証しません。
+
 ### 1. プロジェクトを作成
 
 Supabaseで新しいプロジェクトを作成し、Project SettingsのAPI欄から以下を取得します。

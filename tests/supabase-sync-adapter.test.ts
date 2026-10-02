@@ -7,6 +7,12 @@ import {
   loadSyncChanges,
 } from "../lib/supabase/sync-repository";
 import { DEFAULT_USER_SETTINGS } from "../lib/types";
+import {
+  buildMigrationPlan,
+  canConfirmMigration,
+  migrationConfirmationIssues,
+  migrationConfirmationText,
+} from "../lib/sync/migration-plan";
 import { createOutboxMutation } from "../lib/sync/outbox";
 import { pushOutboxMutation } from "../lib/sync/supabase-adapter";
 
@@ -468,6 +474,438 @@ describe("Supabase Outbox adapter", () => {
       value: { activeRuleVersionId: rule.id },
     });
     expect(bootstrap.latestChangeSequence).toBe(21);
+    expect(bootstrap.excludedInvalidRaceCount).toBe(0);
+  });
+
+  it("loads live data and reports an invalid test race during a normal pull", async () => {
+    const live = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const invalidTest = {
+      ...structuredClone(live),
+      id: "invalid-test-race",
+      clientKey: "invalid-test-race",
+      dataScope: "test" as const,
+      raceNumber: 91,
+    };
+    const { client, rpc } = clientWithResponse({
+      races: [raceToDatabasePayload(live), raceToDatabasePayload(invalidTest)],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    const bootstrap = await loadSyncBootstrap(client);
+
+    expect(bootstrap.races.map((record) => record.value.dataScope)).toEqual(["live"]);
+    expect(bootstrap.excludedInvalidRaceCount).toBe(1);
+    expect(rpc).toHaveBeenCalledOnce();
+    expect(rpc).toHaveBeenCalledWith("get_sync_bootstrap");
+    expect(rpc.mock.calls.flat().join(" ")).not.toMatch(/insert|update|delete|upsert/i);
+  });
+
+  it("fails a normal pull when live data has an invalid race number", async () => {
+    const invalidLive = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      raceNumber: 91,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const { client } = clientWithResponse({
+      races: [raceToDatabasePayload(invalidLive)],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    await expect(loadSyncBootstrap(client)).rejects.toThrow(
+      "raceNumber must be an integer from 1 to 12",
+    );
+  });
+
+  it("previews live races when an unselected test race has an invalid race number", async () => {
+    const live = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const invalidTest = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "invalid-test-race",
+      clientKey: "invalid-test-race",
+      dataScope: "test" as const,
+      raceNumber: 91,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const { client } = clientWithResponse({
+      races: [raceToDatabasePayload(live), raceToDatabasePayload(invalidTest)],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    const bootstrap = await loadSyncBootstrap(client, undefined, ["live"]);
+    const plan = await buildMigrationPlan({
+      localRaces: [live],
+      cloudRaces: bootstrap.races.map((record) => record.value),
+      includeScopes: { live: true, demo: false, test: false },
+    });
+
+    expect(bootstrap.races).toHaveLength(1);
+    expect(bootstrap.races[0]?.value.dataScope).toBe("live");
+    expect(plan.items).toHaveLength(1);
+  });
+
+  it("keeps validating an invalid test race when test is selected", async () => {
+    const invalidTest = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "invalid-test-race",
+      clientKey: "invalid-test-race",
+      dataScope: "test" as const,
+      raceNumber: 91,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const { client } = clientWithResponse({
+      races: [raceToDatabasePayload(invalidTest)],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    await expect(loadSyncBootstrap(client, undefined, ["test"]))
+      .rejects.toThrow("raceNumber must be an integer from 1 to 12");
+  });
+
+  it("ignores invalid demo and test races when neither scope is selected", async () => {
+    const live = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const invalidScopes = (["demo", "test"] as const).map((dataScope, index) => ({
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "invalid-" + dataScope + "-race",
+      clientKey: "invalid-" + dataScope + "-race",
+      dataScope,
+      raceNumber: 91 + index,
+      proposedBets: [],
+      purchasedBets: [],
+    }));
+    const { client } = clientWithResponse({
+      races: [
+        raceToDatabasePayload(live),
+        ...invalidScopes.map(raceToDatabasePayload),
+      ],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    const bootstrap = await loadSyncBootstrap(client, undefined, ["live"]);
+
+    await expect(buildMigrationPlan({
+      localRaces: [live],
+      cloudRaces: bootstrap.races.map((record) => record.value),
+      includeScopes: { live: true, demo: false, test: false },
+    })).resolves.toMatchObject({ counts: { excluded: 0 } });
+  });
+
+  it("keeps a valid out-of-scope cloud race that shares a selected race's identity", async () => {
+    const live = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const cloudTest = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "cloud-test-race",
+      clientKey: "cloud-test-race",
+      dataScope: "test" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    // Server rows carry the Japanese course name, as get_sync_bootstrap returns it.
+    const cloudRow = raceToDatabasePayload(cloudTest);
+    const meeting = cloudRow.meeting as { racecourse: Record<string, unknown> };
+    const cloudRowWithCourseName = {
+      ...cloudRow,
+      meeting: {
+        ...meeting,
+        racecourse: { ...meeting.racecourse, name_ja: cloudTest.course },
+      },
+    };
+    const { client } = clientWithResponse({
+      races: [cloudRowWithCourseName],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    const bootstrap = await loadSyncBootstrap(client, undefined, ["live"]);
+    const plan = await buildMigrationPlan({
+      localRaces: [live],
+      cloudRaces: bootstrap.races.map((record) => record.value),
+      includeScopes: { live: true, demo: false, test: false },
+    });
+
+    expect(bootstrap.races).toHaveLength(1);
+    expect(bootstrap.races[0]?.value.dataScope).toBe("test");
+    expect(plan.items).toHaveLength(1);
+    expect(plan.items[0]?.action).not.toBe("create");
+    expect(plan.items[0]?.cloudRace?.id).toBe(bootstrap.races[0]?.value.id);
+  });
+
+  it("does not count or migrate valid out-of-scope races kept for identity checks", async () => {
+    const race = (overrides: Partial<typeof DEMO_UPCOMING_RACE>) => ({
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      proposedBets: [],
+      purchasedBets: [],
+      ...overrides,
+    });
+    // Server rows carry the Japanese course name, as get_sync_bootstrap returns it.
+    const serverRow = (value: ReturnType<typeof race>) => {
+      const row = raceToDatabasePayload(value);
+      const meeting = row.meeting as { racecourse: Record<string, unknown> };
+      return {
+        ...row,
+        meeting: { ...meeting, racecourse: { ...meeting.racecourse, name_ja: value.course } },
+      };
+    };
+    const localLive = race({ dataScope: "live" });
+    const localTest = race({
+      id: "local-test-race",
+      clientKey: "local-test-race",
+      dataScope: "test",
+      raceNumber: 9,
+    });
+    const cloudValidTest = race({
+      id: "cloud-valid-test-race",
+      clientKey: "cloud-valid-test-race",
+      dataScope: "test",
+      raceNumber: 5,
+    });
+    const cloudInvalidTest = race({
+      id: "cloud-invalid-test-race",
+      clientKey: "cloud-invalid-test-race",
+      dataScope: "test",
+      raceNumber: 91,
+    });
+    const response = {
+      races: [serverRow(cloudValidTest), serverRow(cloudInvalidTest)],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    };
+
+    // A scoped preview keeps the valid test race but never reports it as invalid.
+    const scoped = await loadSyncBootstrap(
+      clientWithResponse(response).client,
+      undefined,
+      ["live"],
+    );
+    expect(scoped.excludedInvalidRaceCount).toBe(0);
+    expect(scoped.races.map((record) => record.clientKey)).toEqual([
+      "cloud-valid-test-race",
+    ]);
+
+    // An unscoped pull counts only the invalid race, not the valid one.
+    const unscoped = await loadSyncBootstrap(clientWithResponse(response).client);
+    expect(unscoped.excludedInvalidRaceCount).toBe(1);
+    expect(unscoped.races.map((record) => record.clientKey)).toEqual([
+      "cloud-valid-test-race",
+    ]);
+
+    const plan = await buildMigrationPlan({
+      localRaces: [localLive, localTest],
+      cloudRaces: scoped.races.map((record) => record.value),
+      includeScopes: { live: true, demo: false, test: false },
+      backupHash: "backup-scope-isolation",
+    });
+
+    // Cloud-only races never become plan items, and the local test race is excluded.
+    expect(plan.items.map((item) => item.sourceId).sort()).toEqual(
+      [localLive.id, localTest.id].sort(),
+    );
+    expect(plan.counts).toEqual({
+      create: 1,
+      identical: 0,
+      conflict: 0,
+      immutable: 0,
+      excluded: 1,
+    });
+    expect(plan.items.find((item) => item.sourceId === localTest.id)).toMatchObject({
+      action: "excluded",
+      selected: false,
+    });
+
+    // The panel's default send targets are the selected create items only.
+    const sendTargets = plan.items
+      .filter((item) => item.action === "create" && item.selected)
+      .map((item) => item.sourceId);
+    expect(sendTargets).toEqual([localLive.id]);
+
+    const confirmation = {
+      planHash: plan.hash,
+      backupSaved: true,
+      backupHash: "backup-scope-isolation",
+      previewReviewed: true,
+      selectedSourceIds: sendTargets,
+      scopeSelection: plan.scopeSelection,
+      confirmationText: migrationConfirmationText(1),
+    };
+    expect(canConfirmMigration(plan, confirmation)).toBe(true);
+
+    // Forcing an out-of-scope race into the selection is refused.
+    expect(migrationConfirmationIssues(plan, {
+      ...confirmation,
+      selectedSourceIds: [localLive.id, localTest.id],
+      confirmationText: migrationConfirmationText(2),
+    })).toContain(`excluded race ${localTest.id} cannot be applied`);
+    for (const cloudId of ["cloud-valid-test-race", "cloud-invalid-test-race"]) {
+      expect(migrationConfirmationIssues(plan, {
+        ...confirmation,
+        selectedSourceIds: [localLive.id, cloudId],
+        confirmationText: migrationConfirmationText(2),
+      })).toContain(`unknown race ${cloudId}`);
+    }
+  });
+
+  it("keeps live filtering while rule and settings migrate in separate attempts", async () => {
+    const live = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const invalidTest = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "invalid-test-race",
+      clientKey: "invalid-test-race",
+      dataScope: "test" as const,
+      raceNumber: 91,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const rule = structuredClone(DEMO_RULE_VERSION);
+    const settings = {
+      ...DEFAULT_USER_SETTINGS,
+      activeRuleVersionId: rule.id,
+    };
+    const ruleRecord = {
+      id: "55555555-5555-4555-8555-555555555555",
+      client_key: rule.id,
+      sync_version: 1,
+      semantic_version: rule.version,
+      content: rule.rules.join("\n"),
+      parameters: { display_name: rule.name, rules: rule.rules },
+      rule_set: {
+        id: "66666666-6666-4666-8666-666666666666",
+        name: rule.name,
+        is_active: true,
+        sync_version: 1,
+      },
+      created_at: rule.createdAt,
+    };
+    let cloudRule: typeof ruleRecord | null = null;
+    let cloudSettings: Record<string, unknown> | null = null;
+    const rpc = vi.fn(async (name: string) => {
+      if (name === "get_sync_bootstrap") {
+        return {
+          data: {
+            races: [raceToDatabasePayload(live), raceToDatabasePayload(invalidTest)],
+            rules: cloudRule ? [cloudRule] : [],
+            settings: cloudSettings,
+            latest_change_seq: cloudSettings ? 3 : cloudRule ? 2 : 1,
+          },
+          error: null,
+        };
+      }
+      if (name === "sync_rule_version") {
+        cloudRule = ruleRecord;
+        return {
+          data: {
+            status: "applied",
+            record: ruleRecord,
+            version: 1,
+            rule_set_version: 1,
+            change_seq: 2,
+          },
+          error: null,
+        };
+      }
+      if (name === "sync_user_settings") {
+        cloudSettings = {
+          user_id: "44444444-4444-4444-8444-444444444444",
+          active_rule_version_id: ruleRecord.id,
+          preferences: settings,
+          sync_version: 1,
+        };
+        return {
+          data: {
+            status: "applied",
+            record: cloudSettings,
+            version: 1,
+            change_seq: 3,
+          },
+          error: null,
+        };
+      }
+      throw new Error("Unexpected RPC: " + name);
+    });
+    const client = { rpc } as unknown as SupabaseClient;
+
+    const initial = await loadSyncBootstrap(client, undefined, ["live"]);
+    const plannedCount = 1 + (initial.settings ? 0 : 1);
+    expect(initial.races).toHaveLength(1);
+    expect(initial.rules).toHaveLength(0);
+    expect(initial.settings).toBeNull();
+    expect(plannedCount).toBe(2);
+
+    const ruleMutation = createOutboxMutation(
+      {
+        ownerScope: "user:44444444-4444-4444-8444-444444444444",
+        entityType: "rule",
+        entityKey: rule.id,
+        payload: rule,
+        expectedVersion: 0,
+      },
+      { randomUUID: () => MUTATION_ID },
+    );
+    await expect(
+      pushOutboxMutation(client, ruleMutation, INSTALLATION_ID),
+    ).resolves.toMatchObject({ status: "applied" });
+
+    const afterRule = await loadSyncBootstrap(client, undefined, ["live"]);
+    expect(afterRule.races).toHaveLength(1);
+    expect(afterRule.rules).toHaveLength(1);
+    expect(afterRule.settings).toBeNull();
+
+    const settingsMutation = createOutboxMutation(
+      {
+        ownerScope: "user:44444444-4444-4444-8444-444444444444",
+        entityType: "settings",
+        entityKey: "profile",
+        payload: settings,
+        expectedVersion: 0,
+      },
+      { randomUUID: () => "33333333-3333-4333-8333-333333333333" },
+    );
+    await expect(
+      pushOutboxMutation(client, settingsMutation, INSTALLATION_ID),
+    ).resolves.toMatchObject({ status: "applied" });
+
+    const afterSettings = await loadSyncBootstrap(client, undefined, ["live"]);
+    expect(afterSettings.races).toHaveLength(1);
+    expect(afterSettings.settings?.value.activeRuleVersionId).toBe(rule.id);
   });
 
   it("uses the database get_sync_changes parameter contract", async () => {

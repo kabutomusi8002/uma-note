@@ -26,6 +26,20 @@ const forbiddenEnvironment = new Proxy<Record<string, unknown>>(
   },
 );
 
+const expectedSecurityHeaders = {
+  "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  "referrer-policy": "strict-origin-when-cross-origin",
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+};
+
+function expectSecurityHeaders(response: Response): void {
+  for (const [name, value] of Object.entries(expectedSecurityHeaders)) {
+    expect(response.headers.get(name)).toBe(value);
+  }
+  expect(response.headers.has("content-security-policy")).toBe(false);
+}
+
 async function fetchImageEndpoint(
   pathname: string,
   method = "GET",
@@ -63,6 +77,7 @@ describe("disabled Vinext image optimization endpoint", () => {
       "text/plain; charset=utf-8",
     );
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expectSecurityHeaders(response);
     expect(body).toBe("Not Found\n");
     expect(body).not.toMatch(
       /stack|node_modules|binding|assets|images|secret|token|password/i,
@@ -81,18 +96,30 @@ describe("disabled Vinext image optimization endpoint", () => {
       "text/plain; charset=utf-8",
     );
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expectSecurityHeaders(response);
     expect(mocks.handlerFetch).not.toHaveBeenCalled();
   });
 
-  it("delegates every other route unchanged", async () => {
-    const expected = new Response("delegated", { status: 207 });
+  it.each([
+    ["HTML", "/", "text/html; charset=utf-8", 200],
+    ["static asset", "/icons/icon-192.png", "image/png", 200],
+    ["error response", "/missing", "text/plain; charset=utf-8", 404],
+  ])("adds security headers to a delegated %s", async (_kind, pathname, contentType, status) => {
+    const expected = new Response("delegated", {
+      status,
+      headers: { "Content-Type": contentType },
+    });
     mocks.handlerFetch.mockResolvedValueOnce(expected);
     const env = {};
-    const request = new Request("https://preview.example.test/icons/icon-192.png");
+    const request = new Request(`https://preview.example.test${pathname}`);
 
     const response = await worker.fetch(request, env, context);
 
-    expect(response).toBe(expected);
+    expect(response).not.toBe(expected);
+    expect(response.status).toBe(status);
+    expect(response.headers.get("content-type")).toBe(contentType);
+    expect(await response.text()).toBe("delegated");
+    expectSecurityHeaders(response);
     expect(mocks.handlerFetch).toHaveBeenCalledOnce();
     expect(mocks.handlerFetch).toHaveBeenCalledWith(request, env, context);
   });
