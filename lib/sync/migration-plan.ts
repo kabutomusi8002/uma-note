@@ -91,6 +91,8 @@ export interface MigrationConfirmation {
   /** Rules and settings selected alongside the race plan. */
   selectedAdditionalCount?: number;
   conflictResolutions?: Readonly<Record<string, MigrationConflictResolution>>;
+  /** Scopes currently selected in the UI; must match the scopes the plan was built for. */
+  scopeSelection: MigrationScopeSelection;
   confirmationText: string;
 }
 
@@ -498,6 +500,13 @@ export function migrationConfirmationIssues(
     issues.push("backup hash does not match");
   }
   if (!confirmation.previewReviewed) issues.push("the preview has not been reviewed");
+  if (
+    RACE_DATA_SCOPES.some(
+      (scope) => confirmation.scopeSelection[scope] !== plan.scopeSelection[scope],
+    )
+  ) {
+    issues.push("scope selection does not match the plan");
+  }
 
   const selectedIds = [...new Set(confirmation.selectedSourceIds)];
   if (selectedIds.length !== confirmation.selectedSourceIds.length) {

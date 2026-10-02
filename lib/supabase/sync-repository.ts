@@ -10,7 +10,7 @@ import {
 import { databaseRecordToRace } from "@/lib/supabase/race-repository";
 import { repositoryError } from "@/lib/supabase/repository-error";
 import { databaseRecordToRule } from "@/lib/supabase/rule-repository";
-import { normalizeRaceNumber } from "@/lib/race-identity";
+import { normalizeRaceNumber, raceNaturalKey } from "@/lib/race-identity";
 import { validatePredictionRuleVersion, validateRaceRecord } from "@/lib/race-format";
 import { RuntimeDataError, validateUserSettings } from "@/lib/runtime-validation";
 
@@ -90,12 +90,16 @@ export async function loadSyncBootstrap(
     if (!RACE_DATA_SCOPES.includes(dataScope as never)) {
       throw new RuntimeDataError("get_sync_bootstrap.races.data_scope", "invalid data scope");
     }
-    if (selectedScopes && !selectedScopes.has(dataScope)) return false;
+    const inScope = !selectedScopes || selectedScopes.has(dataScope);
     try {
       normalizeRaceNumber(numberValue(race.race_number));
-      validateRaceRecord(databaseRecordToRace(row));
+      const value = validateRaceRecord(databaseRecordToRace(row));
+      // Race identity is scope-independent, so out-of-scope races with a valid
+      // natural key are kept: they can still collide with a selected local race.
+      if (!inScope) raceNaturalKey(value);
       return true;
     } catch (cause) {
+      if (!inScope) return false;
       if (!selectedScopes && (dataScope === "demo" || dataScope === "test")) {
         excludedInvalidRaceCount += 1;
         return false;

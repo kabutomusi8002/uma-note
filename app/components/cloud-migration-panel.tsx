@@ -225,6 +225,7 @@ export function CloudMigrationPanel({
         selectedSourceIds,
         selectedAdditionalCount,
         conflictResolutions,
+        scopeSelection: scopes,
         confirmationText,
       }
     : null;
@@ -321,6 +322,14 @@ export function CloudMigrationPanel({
     if (!backup) return;
     setBusy("preview");
     setError("");
+    // Drop the previous plan and approval before awaiting, so a failed refresh
+    // can never leave a confirmable plan for a different scope selection.
+    setCloudPreviewId(null);
+    setPlan(null);
+    setSelectedIds(new Set());
+    setConflictResolutions({});
+    setPreviewReviewed(false);
+    setConfirmationText("");
     try {
       const selectedScopes = (Object.keys(previewScopes) as RaceDataScope[])
         .filter((scope) => previewScopes[scope]);

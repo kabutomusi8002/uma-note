@@ -613,6 +613,52 @@ describe("Supabase Outbox adapter", () => {
     })).resolves.toMatchObject({ counts: { excluded: 0 } });
   });
 
+  it("keeps a valid out-of-scope cloud race that shares a selected race's identity", async () => {
+    const live = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      dataScope: "live" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    const cloudTest = {
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      id: "cloud-test-race",
+      clientKey: "cloud-test-race",
+      dataScope: "test" as const,
+      proposedBets: [],
+      purchasedBets: [],
+    };
+    // Server rows carry the Japanese course name, as get_sync_bootstrap returns it.
+    const cloudRow = raceToDatabasePayload(cloudTest);
+    const meeting = cloudRow.meeting as { racecourse: Record<string, unknown> };
+    const cloudRowWithCourseName = {
+      ...cloudRow,
+      meeting: {
+        ...meeting,
+        racecourse: { ...meeting.racecourse, name_ja: cloudTest.course },
+      },
+    };
+    const { client } = clientWithResponse({
+      races: [cloudRowWithCourseName],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    });
+
+    const bootstrap = await loadSyncBootstrap(client, undefined, ["live"]);
+    const plan = await buildMigrationPlan({
+      localRaces: [live],
+      cloudRaces: bootstrap.races.map((record) => record.value),
+      includeScopes: { live: true, demo: false, test: false },
+    });
+
+    expect(bootstrap.races).toHaveLength(1);
+    expect(bootstrap.races[0]?.value.dataScope).toBe("test");
+    expect(plan.items).toHaveLength(1);
+    expect(plan.items[0]?.action).not.toBe("create");
+    expect(plan.items[0]?.cloudRace?.id).toBe(bootstrap.races[0]?.value.id);
+  });
+
   it("keeps live filtering while rule and settings migrate in separate attempts", async () => {
     const live = {
       ...structuredClone(DEMO_UPCOMING_RACE),

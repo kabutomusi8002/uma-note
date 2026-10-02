@@ -127,6 +127,27 @@ describe("cloud UI safety wiring", () => {
     expect(manualLoad).toContain("cloudUserIdRef.current !== userId");
   });
 
+  it("invalidates the previous plan and approval before refreshing the preview", () => {
+    const loadPreview = migrationSource.slice(
+      migrationSource.indexOf("const loadPreview"),
+      migrationSource.indexOf("const changeScope"),
+    );
+    const refresh = loadPreview.indexOf("await onLoadCloudPreview(");
+    expect(refresh).toBeGreaterThan(0);
+    for (const reset of [
+      "setCloudPreviewId(null)",
+      "setPlan(null)",
+      "setSelectedIds(new Set())",
+      "setPreviewReviewed(false)",
+      'setConfirmationText("")',
+    ]) {
+      const index = loadPreview.indexOf(reset);
+      expect(index, reset).toBeGreaterThan(0);
+      expect(index, reset).toBeLessThan(refresh);
+    }
+    expect(migrationSource).toContain("scopeSelection: scopes");
+  });
+
   it("refuses to resolve a conflict from a stale owner workspace", () => {
     expect(appSource).toContain("assertConflictOwnerCurrent(conflict)");
     expect(appSource).toContain("conflict.ownerScope !== ownerScopeRef.current");
