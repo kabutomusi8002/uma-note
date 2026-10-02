@@ -7,7 +7,12 @@ import {
   loadSyncChanges,
 } from "../lib/supabase/sync-repository";
 import { DEFAULT_USER_SETTINGS } from "../lib/types";
-import { buildMigrationPlan } from "../lib/sync/migration-plan";
+import {
+  buildMigrationPlan,
+  canConfirmMigration,
+  migrationConfirmationIssues,
+  migrationConfirmationText,
+} from "../lib/sync/migration-plan";
 import { createOutboxMutation } from "../lib/sync/outbox";
 import { pushOutboxMutation } from "../lib/sync/supabase-adapter";
 
@@ -657,6 +662,121 @@ describe("Supabase Outbox adapter", () => {
     expect(plan.items).toHaveLength(1);
     expect(plan.items[0]?.action).not.toBe("create");
     expect(plan.items[0]?.cloudRace?.id).toBe(bootstrap.races[0]?.value.id);
+  });
+
+  it("does not count or migrate valid out-of-scope races kept for identity checks", async () => {
+    const race = (overrides: Partial<typeof DEMO_UPCOMING_RACE>) => ({
+      ...structuredClone(DEMO_UPCOMING_RACE),
+      proposedBets: [],
+      purchasedBets: [],
+      ...overrides,
+    });
+    // Server rows carry the Japanese course name, as get_sync_bootstrap returns it.
+    const serverRow = (value: ReturnType<typeof race>) => {
+      const row = raceToDatabasePayload(value);
+      const meeting = row.meeting as { racecourse: Record<string, unknown> };
+      return {
+        ...row,
+        meeting: { ...meeting, racecourse: { ...meeting.racecourse, name_ja: value.course } },
+      };
+    };
+    const localLive = race({ dataScope: "live" });
+    const localTest = race({
+      id: "local-test-race",
+      clientKey: "local-test-race",
+      dataScope: "test",
+      raceNumber: 9,
+    });
+    const cloudValidTest = race({
+      id: "cloud-valid-test-race",
+      clientKey: "cloud-valid-test-race",
+      dataScope: "test",
+      raceNumber: 5,
+    });
+    const cloudInvalidTest = race({
+      id: "cloud-invalid-test-race",
+      clientKey: "cloud-invalid-test-race",
+      dataScope: "test",
+      raceNumber: 91,
+    });
+    const response = {
+      races: [serverRow(cloudValidTest), serverRow(cloudInvalidTest)],
+      rules: [],
+      settings: null,
+      latest_change_seq: 1,
+    };
+
+    // A scoped preview keeps the valid test race but never reports it as invalid.
+    const scoped = await loadSyncBootstrap(
+      clientWithResponse(response).client,
+      undefined,
+      ["live"],
+    );
+    expect(scoped.excludedInvalidRaceCount).toBe(0);
+    expect(scoped.races.map((record) => record.clientKey)).toEqual([
+      "cloud-valid-test-race",
+    ]);
+
+    // An unscoped pull counts only the invalid race, not the valid one.
+    const unscoped = await loadSyncBootstrap(clientWithResponse(response).client);
+    expect(unscoped.excludedInvalidRaceCount).toBe(1);
+    expect(unscoped.races.map((record) => record.clientKey)).toEqual([
+      "cloud-valid-test-race",
+    ]);
+
+    const plan = await buildMigrationPlan({
+      localRaces: [localLive, localTest],
+      cloudRaces: scoped.races.map((record) => record.value),
+      includeScopes: { live: true, demo: false, test: false },
+      backupHash: "backup-scope-isolation",
+    });
+
+    // Cloud-only races never become plan items, and the local test race is excluded.
+    expect(plan.items.map((item) => item.sourceId).sort()).toEqual(
+      [localLive.id, localTest.id].sort(),
+    );
+    expect(plan.counts).toEqual({
+      create: 1,
+      identical: 0,
+      conflict: 0,
+      immutable: 0,
+      excluded: 1,
+    });
+    expect(plan.items.find((item) => item.sourceId === localTest.id)).toMatchObject({
+      action: "excluded",
+      selected: false,
+    });
+
+    // The panel's default send targets are the selected create items only.
+    const sendTargets = plan.items
+      .filter((item) => item.action === "create" && item.selected)
+      .map((item) => item.sourceId);
+    expect(sendTargets).toEqual([localLive.id]);
+
+    const confirmation = {
+      planHash: plan.hash,
+      backupSaved: true,
+      backupHash: "backup-scope-isolation",
+      previewReviewed: true,
+      selectedSourceIds: sendTargets,
+      scopeSelection: plan.scopeSelection,
+      confirmationText: migrationConfirmationText(1),
+    };
+    expect(canConfirmMigration(plan, confirmation)).toBe(true);
+
+    // Forcing an out-of-scope race into the selection is refused.
+    expect(migrationConfirmationIssues(plan, {
+      ...confirmation,
+      selectedSourceIds: [localLive.id, localTest.id],
+      confirmationText: migrationConfirmationText(2),
+    })).toContain(`excluded race ${localTest.id} cannot be applied`);
+    for (const cloudId of ["cloud-valid-test-race", "cloud-invalid-test-race"]) {
+      expect(migrationConfirmationIssues(plan, {
+        ...confirmation,
+        selectedSourceIds: [localLive.id, cloudId],
+        confirmationText: migrationConfirmationText(2),
+      })).toContain(`unknown race ${cloudId}`);
+    }
   });
 
   it("keeps live filtering while rule and settings migrate in separate attempts", async () => {
